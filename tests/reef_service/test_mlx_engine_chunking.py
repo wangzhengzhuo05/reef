@@ -238,3 +238,37 @@ def test_generate_batch_yields_the_same_tokens_as_the_single_path() -> None:
         assert engine.generate_batch([], temperature=0.0) == []
     finally:
         engine.close()
+
+
+def test_a_submission_mid_batch_defers_to_the_next_window() -> None:
+    """Static batching: a rollout submitted while a batch is decoding is not
+    spliced into it, but waits for that batch to drain and then decodes in the
+    next window — correctly, matching the single path. Splicing a fresh prompt
+    into a live batch is what corrupts the Qwen3.5 hybrid cache; this pins that
+    the serving batch never does it, on a model that loads fast."""
+    engine = MLXEngine(MLXEngineConfig(model_path=MODEL, lora_layers=2, max_tokens=32, seed=0))
+    try:
+        # A runs long enough to stay live across the B submission; B is short.
+        a = engine.render_prompt([{"role": "user", "content": "Count from one to twenty."}])
+        b = engine.render_prompt([{"role": "user", "content": "Say hi."}])
+        single_b = engine.generate(b, max_tokens=32, temperature=0.0)
+
+        batcher = engine._serving_batcher()
+        engine.submit_rollout(a, temperature=0.0)
+        engine.pump_rollouts()  # batch idle -> A admitted, now decoding
+        assert engine._run(lambda: len(batcher._live)) == 1
+
+        ticket_b = engine.submit_rollout(b, temperature=0.0)  # queued while A is live
+        engine.pump_rollouts()  # must NOT splice B into the live batch
+        assert engine._run(lambda: len(batcher._live)) == 1  # still just A
+        assert engine._run(batcher._has_queued)  # B still waiting its window
+
+        resolved: dict[object, object] = {}
+        while engine.rollouts_pending():
+            for ticket, rollout in engine.pump_rollouts():
+                resolved[ticket] = rollout
+        assert len(resolved) == 2
+        # B decoded in its own later window, identical to the single path.
+        assert resolved[ticket_b].output_tokens == single_b.output_tokens
+    finally:
+        engine.close()

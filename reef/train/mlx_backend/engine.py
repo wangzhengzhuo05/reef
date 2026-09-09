@@ -582,10 +582,10 @@ class MLXEngine:
         """Sample one completion per prompt, sharing a single continuous batch.
 
         A thin driver over :class:`ContinuousBatcher`: submit every prompt and
-        drain. The batcher inserts into an in-flight ``BatchGenerator``, so the
-        prompts decode together and a finished sequence is evicted rather than
-        padded. To feed concurrent requests into one live batch, drive
-        :class:`ContinuousBatcher` directly (``submit`` then ``step``);
+        drain. All prompts are queued before the first ``step``, so they enter
+        one batch together and decode in parallel, a finished sequence evicted
+        rather than padded. To feed concurrent requests into a shared batch,
+        drive :class:`ContinuousBatcher` directly (``submit`` then ``step``);
         single-sequence streaming stays on :meth:`generate_stream`.
         """
         batcher = ContinuousBatcher(self)
@@ -601,11 +601,13 @@ class MLXEngine:
     def _serving_batcher(self) -> ContinuousBatcher:
         """The long-lived batcher the serving pump submits into.
 
-        One per engine, created on first use: it keeps a single
-        ``BatchGenerator`` alive across requests so a completion inserted while
-        others are mid-flight joins the running batch instead of starting a new
-        one. Distinct from :meth:`generate_batch`'s ephemeral batcher, which
-        drains a fixed set of prompts on the engine thread in one call.
+        One per engine, created on first use, so tickets and the queue persist
+        across pumps. It admits work in batch windows: prompts queued while the
+        current batch decodes wait, and the next idle pump opens a fresh batch
+        for all of them together (see :meth:`ContinuousBatcher._insert_queued`
+        for why splicing into a live batch is unsafe on the hybrid cache).
+        Distinct from :meth:`generate_batch`'s ephemeral batcher, which drains a
+        fixed set of prompts on the engine thread in one call.
         """
         batcher = getattr(self, "_serving_batch", None)
         if batcher is None:
@@ -622,10 +624,11 @@ class MLXEngine:
     ) -> object:
         """Queue one completion for the serving batch; the ticket claims it.
 
-        Thread-safe and non-blocking: the prompt enters the running batch on
-        the next :meth:`pump_rollouts`. A backend fans concurrent requests in
-        through this and pumps them together, so independent rollouts arriving
-        at once share a single decode instead of serializing.
+        Thread-safe and non-blocking: the prompt enters the next batch window,
+        which opens on the first :meth:`pump_rollouts` after the current batch
+        drains (immediately if none is decoding). A backend fans concurrent
+        requests in through this and pumps them together, so rollouts that
+        arrive within one window share a single decode instead of serializing.
         """
         return self._serving_batcher().submit(prompt_tokens, max_tokens=max_tokens, temperature=temperature)
 
@@ -636,10 +639,11 @@ class MLXEngine:
     def pump_rollouts(self) -> list[tuple[object, Rollout]]:
         """Advance the serving batch one round; the rollouts that finished it.
 
-        Runs on the engine thread. Each round inserts newly queued prompts and
-        decodes one token for every live sequence, so calling it in a loop
-        while :meth:`rollouts_pending` holds drains the batch — and a submit
-        between rounds still joins the same decode.
+        Runs on the engine thread. Each round decodes one token for every live
+        sequence; when the batch is empty it admits the queued prompts as the
+        next batch. Calling it in a loop while :meth:`rollouts_pending` holds
+        drains the current batch and then opens the next — a submit between
+        rounds joins the same decode only while the batch is still idle.
         """
         return self._serving_batcher().step()
 
@@ -1662,6 +1666,18 @@ class ContinuousBatcher:
         return finished
 
     def _insert_queued(self) -> None:
+        # Static batching: never splice a queued prompt into a live generation
+        # batch. mlx-lm's continuous BatchGenerator mis-merges the Qwen3.5
+        # hybrid cache when a fresh prompt (a GatedDeltaNet conv-state, sequence
+        # length ~= the conv kernel) is inserted into a decoding batch
+        # (attention KV, sequence length in the hundreds): the per-layer caches
+        # concatenate on mismatched shapes and the decode Metal-OOMs. Draining
+        # the current batch before admitting the next keeps every sequence in a
+        # batch at one generation offset, so only the shape-safe filter() runs.
+        # Sequences within a batch still decode in parallel; only whole batches
+        # serialise.
+        if self._live:
+            return
         with self._queue_lock:
             pending, self._queue = self._queue, []
         if not pending:
