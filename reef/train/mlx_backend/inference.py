@@ -163,16 +163,14 @@ class MLXInferenceBackend(InferenceBackend):
     def __init__(self, runtime: Any) -> None:
         self._runtime = runtime
         # MLX evaluates on one process-wide stream, and training mutates the
-        # same parameters generation reads. Buffered completions share one
-        # continuous batch through the engine's scheduler, so concurrent
-        # requests decode together rather than serializing; this lock keeps a
-        # streamed completion and the batch pump — the two ways of driving the
-        # engine — from running against it at once.
+        # same parameters generation reads. Both completion paths — buffered and
+        # streamed — drive the engine as a single sequence, so this lock keeps
+        # the two from running against that stream at once. Concurrent requests
+        # serialize here rather than sharing a batch: mlx-lm cannot continuously
+        # batch the Qwen3.5 hybrid cache (splicing a fresh prompt into a live
+        # decode corrupts the mixed GatedDeltaNet/attention cache), so a shared
+        # batch bought corruption, not throughput.
         self._engine_lock = asyncio.Lock()
-        # Each buffered request submits a prompt and waits on the future its
-        # ticket resolves; one pump advances the shared batch and resolves them.
-        self._futures: dict[object, asyncio.Future[Any]] = {}
-        self._pump_task: asyncio.Task[None] | None = None
 
     async def inference(
         self,
@@ -198,47 +196,20 @@ class MLXInferenceBackend(InferenceBackend):
         return self._response(payload, rollout, request.parser, force_reasoning=opens_reasoning)
 
     async def _submit(self, prompt_tokens: Sequence[int], request: _ChatRequest) -> Any:
-        """Join the shared batch and await this request's rollout."""
-        engine = self._runtime.engine
-        ticket = engine.submit_rollout(prompt_tokens, max_tokens=request.max_tokens, temperature=request.temperature)
-        future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
-        self._futures[ticket] = future
-        self._ensure_pump()
-        return await future
+        """Sample this request's rollout as a single sequence on the engine thread.
 
-    def _ensure_pump(self) -> None:
-        """Guarantee a pump is draining the batch for the queued tickets."""
-        if self._pump_task is None or self._pump_task.done():
-            self._pump_task = asyncio.ensure_future(self._pump())
-
-    async def _pump(self) -> None:
-        """Advance the shared batch until it empties, resolving each rollout.
-
-        Held under ``_engine_lock`` so a streamed completion never drives the
-        engine mid-round. On the way out the loop re-checks for work a request
-        may have queued in the exit window, so no ticket is ever stranded.
+        Held under ``_engine_lock`` so a buffered completion and a streamed one
+        never drive the one MLX stream at once; concurrent buffered requests
+        serialize through it in turn.
         """
-        while True:
-            async with self._engine_lock:
-                engine = self._runtime.engine
-                while engine.rollouts_pending():
-                    try:
-                        finished = await asyncio.to_thread(engine.pump_rollouts)
-                    except Exception as exc:
-                        self._fail_pending(exc)
-                        return
-                    for ticket, rollout in finished:
-                        waiter = self._futures.pop(ticket, None)
-                        if waiter is not None and not waiter.done():
-                            waiter.set_result(rollout)
-            if not self._runtime.engine.rollouts_pending():
-                return
-
-    def _fail_pending(self, exc: BaseException) -> None:
-        pending, self._futures = self._futures, {}
-        for waiter in pending.values():
-            if not waiter.done():
-                waiter.set_exception(exc)
+        async with self._engine_lock:
+            engine = self._runtime.engine
+            return await asyncio.to_thread(
+                engine.generate,
+                prompt_tokens,
+                max_tokens=request.max_tokens,
+                temperature=request.temperature,
+            )
 
     async def inference_stream(
         self,
