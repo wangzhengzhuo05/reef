@@ -434,6 +434,38 @@ class MLXRuntime(TrainingRuntime):
         self._pending.pop(candidate.candidate_id, None)
         logger.info("rejected mlx candidate %s: %s", candidate.candidate_id, decision.reason)
 
+    def probe_candidate(
+        self,
+        candidate_id: str,
+        prompts: Sequence[Sequence[int]],
+        *,
+        max_tokens: int,
+    ) -> list[str]:
+        """Greedily generate from a pending candidate's weights, then restore serving.
+
+        A candidate evaluator uses this to measure a trained-but-unselected
+        candidate on a fixed probe before Reef decides whether to publish it.
+        The candidate's parameters are swapped in only for the probe and only
+        while inference admission is closed, and the pre-probe serving
+        parameters are restored before this returns, so no live request is ever
+        answered by weights Reef has not selected.
+        """
+        snapshot = self._pending.get(candidate_id)
+        if snapshot is None:
+            raise RuntimeContractError(f"no pending mlx candidate {candidate_id!r} to probe")
+        self._inference_admission.close(wait=True, timeout=self.inference_timeout_s)
+        try:
+            serving = self._engine.adapter_snapshot()
+            self._engine.apply_adapter(snapshot)
+            try:
+                return [
+                    self._engine.generate(prompt, max_tokens=max_tokens, temperature=0.0).text for prompt in prompts
+                ]
+            finally:
+                self._engine.apply_adapter(serving)
+        finally:
+            self._inference_admission.open()
+
     def restore_checkpoint(self, artifact: Artifact) -> str:
         """Roll serving back to a published adapter."""
         local_path = artifact.local_path
