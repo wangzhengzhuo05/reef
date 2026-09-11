@@ -25,6 +25,72 @@ class AlwaysSelect(CandidateSelector):
         )
 
 
+class RegressionGate(CandidateSelector):
+    """Publish a candidate only while its score has not regressed below the best.
+
+    Where :class:`AlwaysSelect` publishes every evaluated candidate, this reads
+    one scalar metric from the evaluation and selects a candidate only when that
+    score stays within ``margin`` of the best score selected so far; otherwise it
+    rejects, and serving holds the last selected weights. That makes it
+    best-checkpoint selection made online: an objective that has passed its peak
+    cannot compound regressing steps into serving the way ``AlwaysSelect`` lets
+    it. The bar is seeded by the first candidate, so the initial climb is always
+    admitted and the gate only bites once a peak exists to regress from.
+
+    The metric is whatever the paired evaluator records — a held-out score, an
+    accuracy, a clean-output rate. ``higher_is_better=False`` gates a metric that
+    improves as it falls (a loss, an error rate).
+    """
+
+    def __init__(self, *, metric: str, margin: float = 0.0, higher_is_better: bool = True) -> None:
+        if not isinstance(metric, str) or not metric:
+            raise ValueError("RegressionGate needs a non-empty metric name")
+        if margin < 0:
+            raise ValueError("RegressionGate margin must be non-negative")
+        self._metric = metric
+        self._margin = float(margin)
+        self._higher_is_better = bool(higher_is_better)
+        #: The best oriented score selected so far; ``None`` until the first.
+        self._best: float | None = None
+
+    def _oriented(self, value: float) -> float:
+        """The score in higher-is-better orientation, so one comparison serves both."""
+        return value if self._higher_is_better else -value
+
+    def decide(self, candidate: UpdateCandidate, evaluation: EvaluationResult) -> SelectionDecision:
+        try:
+            raw = float(evaluation.metrics[self._metric])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"RegressionGate metric {self._metric!r} is missing or non-numeric in the evaluation"
+            ) from exc
+        score = self._oriented(raw)
+        bar = score if self._best is None else self._best - self._margin
+        best_raw = raw if self._best is None else (self._best if self._higher_is_better else -self._best)
+        common = {
+            "policy": "regression-gate",
+            "policy_version": "1",
+            "evaluation": evaluation,
+            "metrics": {"metric": self._metric, "value": raw, "best": best_raw, "margin": self._margin},
+        }
+        if score >= bar:
+            self._best = score if self._best is None else max(self._best, score)
+            new_best_raw = self._best if self._higher_is_better else -self._best
+            return SelectionDecision(
+                outcome="select",
+                reason=f"{self._metric} {raw:g} within margin of best {new_best_raw:g}",
+                **common,
+            )
+        return SelectionDecision(
+            outcome="reject",
+            reason=(
+                f"{self._metric} {raw:g} regressed past margin {self._margin:g} below best {best_raw:g}; "
+                "holding the last selected weights"
+            ),
+            **common,
+        )
+
+
 class DefaultCandidateEvaluationPlugin(CandidateEvaluationPlugin):
     """Combine an evaluator with a selector that defaults to ``AlwaysSelect``."""
 
@@ -53,4 +119,4 @@ class DefaultCandidateEvaluationPlugin(CandidateEvaluationPlugin):
         return self._selector.decide(candidate, evaluation)
 
 
-__all__ = ["AlwaysSelect", "DefaultCandidateEvaluationPlugin"]
+__all__ = ["AlwaysSelect", "DefaultCandidateEvaluationPlugin", "RegressionGate"]
