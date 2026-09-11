@@ -67,27 +67,28 @@ class RegressionGate(CandidateSelector):
         score = self._oriented(raw)
         bar = score if self._best is None else self._best - self._margin
         best_raw = raw if self._best is None else (self._best if self._higher_is_better else -self._best)
-        common = {
-            "policy": "regression-gate",
-            "policy_version": "1",
-            "evaluation": evaluation,
-            "metrics": {"metric": self._metric, "value": raw, "best": best_raw, "margin": self._margin},
-        }
+        metrics = {"metric": self._metric, "value": raw, "best": best_raw, "margin": self._margin}
         if score >= bar:
             self._best = score if self._best is None else max(self._best, score)
             new_best_raw = self._best if self._higher_is_better else -self._best
             return SelectionDecision(
                 outcome="select",
+                policy="regression-gate",
+                policy_version="1",
                 reason=f"{self._metric} {raw:g} within margin of best {new_best_raw:g}",
-                **common,
+                evaluation=evaluation,
+                metrics=metrics,
             )
         return SelectionDecision(
             outcome="reject",
+            policy="regression-gate",
+            policy_version="1",
             reason=(
                 f"{self._metric} {raw:g} regressed past margin {self._margin:g} below best {best_raw:g}; "
                 "holding the last selected weights"
             ),
-            **common,
+            evaluation=evaluation,
+            metrics=metrics,
         )
 
 
