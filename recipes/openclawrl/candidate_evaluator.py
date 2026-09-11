@@ -1,4 +1,4 @@
-"""OpenClaw-RL's candidate probe, gated by reef's built-in RegressionGate.
+"""OpenClaw-RL's candidate evaluation: a style probe under a regression gate.
 
 Reef's default selector is ``AlwaysSelect``, which publishes every trained step.
 That is what lets OpenClaw-RL's stream keep its post-adaptation collapse: a few
@@ -7,15 +7,16 @@ because every step reaches serving the drift compounds instead of rolling back
 (the verdicts show pre-adaptation rejects as style violations on healthy
 replies, post-adaptation rejects as empty "no-reply" turns).
 
-This plugin supplies the **probe** — the OpenClaw-RL-specific measurement — and
-pairs it with reef's generic :class:`~reef.train.evaluation.RegressionGate`
-selector for the decision. The probe runs each candidate on a fixed, pinned set
-of GSM8K openings and scores every reply with the benchmark's own
-``student_violations`` criterion (a non-empty reply that shows its working in
-plain prose, no markdown), reporting a ``clean_rate``. The gate then selects a
-candidate only while that rate has not regressed below the best seen — so the
-stream is free to climb during adaptation and, once it peaks, a step that makes
-the policy answer worse is held out of serving.
+One cohesive plugin, :class:`OpenClawRLCandidateEvaluationPlugin`, does both
+halves. Its ``evaluate`` is the OpenClaw-RL-specific probe — each candidate runs
+on a fixed, pinned set of GSM8K openings, and every reply is scored with the
+benchmark's own ``student_violations`` criterion (a non-empty reply that shows
+its working in plain prose, no markdown), reporting a ``clean_rate``. Its
+``decide`` comes from reef's generic
+:class:`~reef.train.evaluation.RegressionGateMixin`: select a candidate only
+while that rate has not regressed below the best seen — so the stream is free to
+climb during adaptation and, once it peaks, a step that makes the policy answer
+worse is held out of serving.
 
 The probe set is pinned on purpose: a probe that resampled its problems would
 measure the problems, not the candidate.
@@ -39,7 +40,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from reef.train.evaluation import DefaultCandidateEvaluationPlugin, EvaluationResult, RegressionGate, UpdateCandidate
+from reef.train.evaluation import CandidateEvaluationPlugin, EvaluationResult, RegressionGateMixin, UpdateCandidate
 
 logger = logging.getLogger(__name__)
 
@@ -119,14 +120,21 @@ def _load_criterion() -> Any:
     return module.student_violations
 
 
-class OpenClawRLStyleProbe:
-    """Measure a candidate's clean-reply rate on the pinned GSM8K probe.
+class OpenClawRLCandidateEvaluationPlugin(RegressionGateMixin, CandidateEvaluationPlugin):
+    """The whole OpenClaw-RL candidate evaluation in one class.
 
-    A :class:`~reef.train.evaluation.CandidateEvaluator`: it only *measures*. The
-    publish decision is reef's ``RegressionGate``, paired in :func:`build`.
+    ``evaluate`` is the OpenClaw-RL-specific probe — a pinned GSM8K set scored
+    with the benchmark's ``student_violations`` criterion, run through the
+    runtime's ``probe_candidate``. ``decide`` comes from
+    :class:`~reef.train.evaluation.RegressionGateMixin`: publish a candidate only
+    while its ``clean_rate`` has not regressed below the best seen, so the stream
+    climbs during adaptation and a step that makes the policy answer worse is held
+    out of serving. The probe set is pinned so a score reflects the candidate, not
+    a freshly sampled problem.
     """
 
-    def __init__(self, runtime: Any, *, probe_size: int, max_tokens: int) -> None:
+    def __init__(self, runtime: Any, *, probe_size: int, max_tokens: int, regression_margin: float) -> None:
+        super().__init__(metric=_METRIC, margin=regression_margin)
         self._runtime = runtime
         self._max_tokens = int(max_tokens)
         self._probe = _PROBE[: max(1, int(probe_size))]
@@ -174,8 +182,8 @@ def build(
     runtime: Any,
     scenario: str,
     environ: Mapping[str, str],
-) -> DefaultCandidateEvaluationPlugin:
-    """Factory for ``evaluation.module``: the OpenClaw-RL probe behind a RegressionGate.
+) -> OpenClawRLCandidateEvaluationPlugin:
+    """Factory for ``evaluation.module``: the OpenClaw-RL probe + regression gate.
 
     Requires a runtime that can probe an unpublished candidate — the in-process
     MLX runtime's ``probe_candidate``. A runtime without it (e.g. the Ray
@@ -187,20 +195,20 @@ def build(
             f"{_EVALUATOR} needs a runtime that can probe an unpublished candidate; "
             f"{type(runtime).__name__} does not provide probe_candidate()"
         )
-    probe = OpenClawRLStyleProbe(
+    plugin = OpenClawRLCandidateEvaluationPlugin(
         runtime,
         probe_size=int(config.get("probe_size", 8)),
         max_tokens=int(config.get("max_tokens", 96)),
+        regression_margin=float(config.get("regression_margin", 0.17)),
     )
-    gate = RegressionGate(metric=_METRIC, margin=float(config.get("regression_margin", 0.17)))
     logger.info(
-        "%s active for scenario %s: %d pinned probes, RegressionGate margin %.2f",
+        "%s active for scenario %s: %d pinned probes, regression-gate margin %.2f",
         _EVALUATOR,
         scenario,
-        len(probe._probe),
-        gate._margin,
+        len(plugin._probe),
+        plugin._margin,
     )
-    return DefaultCandidateEvaluationPlugin(probe, gate)
+    return plugin
 
 
-__all__ = ["OpenClawRLStyleProbe", "build"]
+__all__ = ["OpenClawRLCandidateEvaluationPlugin", "build"]

@@ -25,28 +25,37 @@ class AlwaysSelect(CandidateSelector):
         )
 
 
-class RegressionGate(CandidateSelector):
-    """Publish a candidate only while its score has not regressed below the best.
+class RegressionGateMixin:
+    """Mixin giving a :class:`CandidateEvaluationPlugin` best-checkpoint ``decide()``.
 
-    Where :class:`AlwaysSelect` publishes every evaluated candidate, this reads
-    one scalar metric from the evaluation and selects a candidate only when that
-    score stays within ``margin`` of the best score selected so far; otherwise it
-    rejects, and serving holds the last selected weights. That makes it
-    best-checkpoint selection made online: an objective that has passed its peak
-    cannot compound regressing steps into serving the way ``AlwaysSelect`` lets
-    it. The bar is seeded by the first candidate, so the initial climb is always
-    admitted and the gate only bites once a peak exists to regress from.
+    Where :class:`AlwaysSelect` publishes every evaluated candidate, a plugin that
+    mixes this in reads one scalar metric from the evaluation and selects a
+    candidate only while that score stays within ``margin`` of the best score
+    selected so far; otherwise it rejects, and serving holds the last selected
+    weights. That makes it best-checkpoint selection made online: an objective
+    that has passed its peak cannot compound regressing steps into serving. The
+    bar is seeded by the first candidate, so the initial climb is always admitted
+    and the gate only bites once a peak exists to regress from.
 
-    The metric is whatever the paired evaluator records — a held-out score, an
-    accuracy, a clean-output rate. ``higher_is_better=False`` gates a metric that
-    improves as it falls (a loss, an error rate).
+    Combine it with a plugin that supplies the measurement::
+
+        class MyPlugin(RegressionGateMixin, CandidateEvaluationPlugin):
+            def __init__(self, ...):
+                super().__init__(metric="clean_rate", margin=0.17)
+                ...
+            def evaluate(self, candidate): ...
+
+    The metric is whatever ``evaluate`` records — a held-out score, an accuracy,
+    a clean-output rate. ``higher_is_better=False`` gates a metric that improves
+    as it falls (a loss, an error rate).
     """
 
     def __init__(self, *, metric: str, margin: float = 0.0, higher_is_better: bool = True) -> None:
         if not isinstance(metric, str) or not metric:
-            raise ValueError("RegressionGate needs a non-empty metric name")
+            raise ValueError("RegressionGateMixin needs a non-empty metric name")
         if margin < 0:
-            raise ValueError("RegressionGate margin must be non-negative")
+            raise ValueError("RegressionGateMixin margin must be non-negative")
+        super().__init__()
         self._metric = metric
         self._margin = float(margin)
         self._higher_is_better = bool(higher_is_better)
@@ -62,7 +71,7 @@ class RegressionGate(CandidateSelector):
             raw = float(evaluation.metrics[self._metric])
         except (KeyError, TypeError, ValueError) as exc:
             raise ValueError(
-                f"RegressionGate metric {self._metric!r} is missing or non-numeric in the evaluation"
+                f"the regression gate's metric {self._metric!r} is missing or non-numeric in the evaluation"
             ) from exc
         score = self._oriented(raw)
         bar = score if self._best is None else self._best - self._margin
@@ -120,4 +129,4 @@ class DefaultCandidateEvaluationPlugin(CandidateEvaluationPlugin):
         return self._selector.decide(candidate, evaluation)
 
 
-__all__ = ["AlwaysSelect", "DefaultCandidateEvaluationPlugin", "RegressionGate"]
+__all__ = ["AlwaysSelect", "DefaultCandidateEvaluationPlugin", "RegressionGateMixin"]

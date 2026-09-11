@@ -22,7 +22,7 @@ from reef.train.evaluation.contracts import (
     SelectionDecision,
     UpdateCandidate,
 )
-from reef.train.evaluation.evaluators import AlwaysSelect, DefaultCandidateEvaluationPlugin, RegressionGate
+from reef.train.evaluation.evaluators import AlwaysSelect, DefaultCandidateEvaluationPlugin, RegressionGateMixin
 
 __all__ = [
     "AlwaysSelect",
@@ -34,7 +34,7 @@ __all__ = [
     "CandidateSelector",
     "DefaultCandidateEvaluationPlugin",
     "EvaluationResult",
-    "RegressionGate",
+    "RegressionGateMixin",
     "SelectionDecision",
     "UpdateCandidate",
     "build_candidate_evaluation",
