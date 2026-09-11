@@ -1,34 +1,32 @@
-"""A candidate-selection gate for OpenClaw-RL: publish only non-regressing steps.
+"""OpenClaw-RL's candidate probe, gated by reef's built-in RegressionGate.
 
-Reef's default selector is ``AlwaysSelect`` — every trained candidate reaches
-serving. For an RL objective that is usually right, but OpenClaw-RL's stream has
-a failure mode the default cannot catch: a few optimizer steps past adaptation
-the policy stops answering and loops on its tools, and because every step is
-published the drift compounds instead of rolling back. The verdicts show it
-plainly — pre-adaptation rejects are all style violations on healthy replies;
-post-adaptation rejects flip to empty "no-reply" turns.
+Reef's default selector is ``AlwaysSelect``, which publishes every trained step.
+That is what lets OpenClaw-RL's stream keep its post-adaptation collapse: a few
+steps past adaptation the policy stops answering and loops on its tools, and
+because every step reaches serving the drift compounds instead of rolling back
+(the verdicts show pre-adaptation rejects as style violations on healthy
+replies, post-adaptation rejects as empty "no-reply" turns).
 
-This plugin gates on exactly that signal. Before Reef selects a candidate it is
-probed on a fixed, pinned set of GSM8K openings; each reply is scored with the
-benchmark's own ``student_violations`` criterion (a non-empty reply that shows
-its working in plain prose, no markdown). The candidate is selected only while
-its clean-reply rate has not regressed below the best rate seen so far, minus a
-tolerance. So the stream is free to climb during adaptation (the bar starts at
-zero and rises with it), and once it peaks a step that makes the policy answer
-worse is rejected — serving holds the last good weights instead of following the
-objective off the cliff. Best-checkpoint selection, made online.
+This plugin supplies the **probe** — the OpenClaw-RL-specific measurement — and
+pairs it with reef's generic :class:`~reef.train.evaluation.RegressionGate`
+selector for the decision. The probe runs each candidate on a fixed, pinned set
+of GSM8K openings and scores every reply with the benchmark's own
+``student_violations`` criterion (a non-empty reply that shows its working in
+plain prose, no markdown), reporting a ``clean_rate``. The gate then selects a
+candidate only while that rate has not regressed below the best seen — so the
+stream is free to climb during adaptation and, once it peaks, a step that makes
+the policy answer worse is held out of serving.
 
-The probe set is pinned on purpose: a gate that resampled its problems would
-measure the problems, not the candidate. It measures a candidate against a
-fixed ruler, and against the incumbent's score on that same ruler.
+The probe set is pinned on purpose: a probe that resampled its problems would
+measure the problems, not the candidate.
 
-Wire it into a deployment's ``reef`` config:
+Wire it into a deployment's config:
 
     evaluation:
       module: recipes.openclawrl.candidate_evaluator:build
       config:
-        probe_size: 6          # pinned GSM8K openings to probe
-        max_tokens: 320        # per-probe generation budget
+        probe_size: 8            # pinned GSM8K openings to probe
+        max_tokens: 96           # per-probe generation budget
         regression_margin: 0.17  # tolerated dip below the running best
 """
 
@@ -41,12 +39,18 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from reef.train.evaluation.contracts import EvaluationResult, SelectionDecision, UpdateCandidate
+from reef.train.evaluation import (
+    DefaultCandidateEvaluationPlugin,
+    EvaluationResult,
+    RegressionGate,
+    UpdateCandidate,
+)
 
 logger = logging.getLogger(__name__)
 
-_EVALUATOR = "openclawrl-style-regression-gate"
+_EVALUATOR = "openclawrl-style-probe"
 _VERSION = "1"
+_METRIC = "clean_rate"
 
 # A fixed, pinned held-out probe: canonical GSM8K questions with gold answers.
 # Held constant for the life of a run so a score reflects the candidate, not a
@@ -65,7 +69,10 @@ _PROBE: tuple[tuple[str, str], ...] = (
         "Betty is saving for a $100 wallet. She has only half the money she needs. Her parents give her $15, and her grandparents give twice as much as her parents. How much more money does Betty need to buy the wallet?",
         "5",
     ),
-    ("James writes a 3-page letter to 2 different friends twice a week. How many pages does he write a year?", "624"),
+    (
+        "James writes a 3-page letter to 2 different friends twice a week. How many pages does he write a year?",
+        "624",
+    ),
     (
         "Julie is reading a 120-page book. Yesterday she read 12 pages and today she read twice as many pages as yesterday. If she wants to read half of the remaining pages tomorrow, how many pages should she read?",
         "42",
@@ -101,9 +108,9 @@ _INSTRUCTION = (
 def _load_criterion() -> Any:
     """The benchmark's own ``student_violations``, loaded from the user_sim package.
 
-    Reused rather than re-implemented so the gate scores a reply exactly as the
+    Reused rather than re-implemented so the probe scores a reply exactly as the
     judge that produced the run's verdicts does; if the criterion moves, so does
-    the gate.
+    the probe.
     """
     personas = Path(__file__).parent / "examples" / "openclawrl" / "user_sim" / "personas.py"
     spec = importlib.util.spec_from_file_location("openclawrl_personas", personas)
@@ -117,26 +124,18 @@ def _load_criterion() -> Any:
     return module.student_violations
 
 
-class OpenClawRLStyleRegressionGate:
-    """Probe each candidate and reject the ones that answer worse than the best."""
+class OpenClawRLStyleProbe:
+    """Measure a candidate's clean-reply rate on the pinned GSM8K probe.
 
-    def __init__(
-        self,
-        runtime: Any,
-        *,
-        probe_size: int,
-        max_tokens: int,
-        regression_margin: float,
-    ) -> None:
+    A :class:`~reef.train.evaluation.CandidateEvaluator`: it only *measures*. The
+    publish decision is reef's ``RegressionGate``, paired in :func:`build`.
+    """
+
+    def __init__(self, runtime: Any, *, probe_size: int, max_tokens: int) -> None:
         self._runtime = runtime
         self._max_tokens = int(max_tokens)
-        self._margin = float(regression_margin)
         self._probe = _PROBE[: max(1, int(probe_size))]
         self._violations = _load_criterion()
-        # The bar a candidate must clear: the best clean rate seen so far. It
-        # starts at zero, so the whole adaptation climb is admitted; it only
-        # bites once the stream has a peak to regress from.
-        self._best = 0.0
         # Prompts rendered once — the ruler is fixed for the run.
         self._prompts = [
             runtime.engine.render_prompt([{"role": "user", "content": f"{_INSTRUCTION}\n\n{question}"}])
@@ -148,7 +147,7 @@ class OpenClawRLStyleRegressionGate:
 
         This is the judge's own reward condition minus the gold-answer check:
         the collapse is an empty or markdown-laden reply, and folding in
-        correctness would only add sampling noise to a six-item probe. The
+        correctness would only add sampling noise to a small probe. The
         gold-answer hit rate is reported alongside for visibility.
         """
         return bool(reply.strip()) and not self._violations(reply)
@@ -165,38 +164,12 @@ class OpenClawRLStyleRegressionGate:
             evaluator=_EVALUATOR,
             evaluator_version=_VERSION,
             metrics={
-                "clean_rate": clean / total if total else 0.0,
+                _METRIC: clean / total if total else 0.0,
                 "answered_rate": answered / total if total else 0.0,
                 "gold_rate": correct / total if total else 0.0,
                 "n_clean": clean,
                 "n_total": total,
-                "best_clean_rate": self._best,
             },
-        )
-
-    def decide(self, candidate: UpdateCandidate, evaluation: EvaluationResult) -> SelectionDecision:
-        rate = float(evaluation.metrics["clean_rate"])
-        bar = self._best - self._margin
-        if rate >= bar:
-            self._best = max(self._best, rate)
-            return SelectionDecision(
-                outcome="select",
-                policy=_EVALUATOR,
-                policy_version=_VERSION,
-                reason=f"clean_rate {rate:.2f} >= bar {bar:.2f} (running best {self._best:.2f})",
-                evaluation=evaluation,
-                metrics={"bar": bar, "best_clean_rate": self._best},
-            )
-        return SelectionDecision(
-            outcome="reject",
-            policy=_EVALUATOR,
-            policy_version=_VERSION,
-            reason=(
-                f"clean_rate {rate:.2f} < bar {bar:.2f} (running best {self._best:.2f}); "
-                "holding the last selected weights"
-            ),
-            evaluation=evaluation,
-            metrics={"bar": bar, "best_clean_rate": self._best},
         )
 
 
@@ -206,8 +179,8 @@ def build(
     runtime: Any,
     scenario: str,
     environ: Mapping[str, str],
-) -> OpenClawRLStyleRegressionGate:
-    """Factory for ``evaluation.module``: one gate per scenario.
+) -> DefaultCandidateEvaluationPlugin:
+    """Factory for ``evaluation.module``: the OpenClaw-RL probe behind a RegressionGate.
 
     Requires a runtime that can probe an unpublished candidate — the in-process
     MLX runtime's ``probe_candidate``. A runtime without it (e.g. the Ray
@@ -219,20 +192,20 @@ def build(
             f"{_EVALUATOR} needs a runtime that can probe an unpublished candidate; "
             f"{type(runtime).__name__} does not provide probe_candidate()"
         )
-    gate = OpenClawRLStyleRegressionGate(
+    probe = OpenClawRLStyleProbe(
         runtime,
-        probe_size=int(config.get("probe_size", 6)),
-        max_tokens=int(config.get("max_tokens", 320)),
-        regression_margin=float(config.get("regression_margin", 0.17)),
+        probe_size=int(config.get("probe_size", 8)),
+        max_tokens=int(config.get("max_tokens", 96)),
     )
+    gate = RegressionGate(metric=_METRIC, margin=float(config.get("regression_margin", 0.17)))
     logger.info(
-        "%s active for scenario %s: %d pinned probes, margin %.2f",
+        "%s active for scenario %s: %d pinned probes, RegressionGate margin %.2f",
         _EVALUATOR,
         scenario,
-        len(gate._probe),
+        len(probe._probe),
         gate._margin,
     )
-    return gate
+    return DefaultCandidateEvaluationPlugin(probe, gate)
 
 
-__all__ = ["OpenClawRLStyleRegressionGate", "build"]
+__all__ = ["OpenClawRLStyleProbe", "build"]
