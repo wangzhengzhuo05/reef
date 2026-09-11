@@ -41,11 +41,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from reef.train.evaluation.contracts import (
-    EvaluationResult,
-    SelectionDecision,
-    UpdateCandidate,
-)
+from reef.train.evaluation.contracts import EvaluationResult, SelectionDecision, UpdateCandidate
 
 logger = logging.getLogger(__name__)
 

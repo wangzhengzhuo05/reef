@@ -78,10 +78,10 @@ class FakeEngine:
         self.publications += 1
         return f"fake-{self.publications}"
 
-    def save_adapter(self, destination: Path, *, provenance_extra=None) -> Path:
+    def save_adapter(self, destination: Path, *, origin_extra=None) -> Path:
         destination.mkdir(parents=True, exist_ok=True)
         (destination / "adapters.safetensors").write_bytes(b"weights")
-        (destination / "reef_provenance.json").write_text(json.dumps(dict(provenance_extra or {})))
+        (destination / "reef_origin.json").write_text(json.dumps(dict(origin_extra or {})))
         self.saved.append(destination)
         return destination
 

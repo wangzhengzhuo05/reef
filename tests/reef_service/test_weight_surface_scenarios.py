@@ -119,7 +119,7 @@ def test_a_restarted_engine_gets_the_recovered_head_loaded_back(tmp_path: Path) 
 
 
 def test_an_artifact_with_no_recorded_version_is_left_alone(tmp_path: Path) -> None:
-    # An unknown published version is not evidence of a stale engine, and a
+    # An unknown published version is not a sign of a stale engine, and a
     # runtime that reports none of its own cannot be compared against.
     class Runtime(StubTrainingRuntime):
         def serving_runtime_load_id(self):

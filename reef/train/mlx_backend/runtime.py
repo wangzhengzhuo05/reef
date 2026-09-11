@@ -307,7 +307,7 @@ class MLXRuntime(TrainingRuntime):
             )
             self._engine.save_adapter(
                 destination,
-                provenance_extra={
+                origin_extra={
                     "scenario_step": scenario_step,
                     "training_job_id": candidate_id,
                     # The objective is whichever family actually trained these

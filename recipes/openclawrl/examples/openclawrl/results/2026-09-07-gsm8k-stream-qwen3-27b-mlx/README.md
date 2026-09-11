@@ -15,7 +15,7 @@ held-out control separates the trained policy from the base model at
 
 The reference harness ([`harness/agent.py`](../../harness/agent.py)) runs each
 session as a Harbor task — a container with the real Hermes agent, a judge
-sidecar, and reef-eval sequencing them. Those are plain Linux containers and
+service, and reef-eval sequencing them. Those are plain Linux containers and
 run under Docker on macOS against a host-native Reef+MLX service (the harness
 takes a host-reachable `reef_url`, so the split is supported by design). This
 result, however, was produced by a **Mac-native driver standing in for

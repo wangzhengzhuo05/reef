@@ -42,7 +42,7 @@ opt_step=1  delta_l2=0.080952  changed=32/32  ratio=0.999434  kl=+6.27e-04  toke
   A drift away from 1 means the batch aged behind the serving weights.
 
 Each step publishes a durable adapter artifact through Reef's normal Git-LFS
-stack, carrying its compatibility provenance:
+stack, carrying its compatibility record:
 
 ```json
 {

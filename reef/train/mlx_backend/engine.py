@@ -42,8 +42,8 @@ from reef.train.mlx_backend.rows import DistillationRow, GenerationListener, Tea
 
 ADAPTER_WEIGHTS = "adapters.safetensors"
 ADAPTER_CONFIG = "adapter_config.json"
-PROVENANCE = "reef_provenance.json"
-PROVENANCE_SCHEMA = "reef.mlx.adapter/1"
+ORIGIN = "reef_origin.json"
+ORIGIN_SCHEMA = "reef.mlx.adapter/1"
 
 DEFAULT_LORA_KEYS = ("self_attn.q_proj", "self_attn.v_proj")
 
@@ -1433,7 +1433,7 @@ class MLXEngine:
         self._publication += 1
         return f"mlx-{os.getpid()}-{self._publication}"
 
-    def provenance(self, *, extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    def origin(self, *, extra: Mapping[str, Any] | None = None) -> dict[str, Any]:
         import importlib.metadata
 
         def installed(package: str) -> str:
@@ -1444,7 +1444,7 @@ class MLXEngine:
 
         versions = {package: installed(package) for package in ("mlx", "mlx-lm")}
         record: dict[str, Any] = {
-            "schema": PROVENANCE_SCHEMA,
+            "schema": ORIGIN_SCHEMA,
             "base_model": self._config.model_path,
             "tokenizer": self._config.model_path,
             "lora_parameters": self._lora_parameters(),
@@ -1455,10 +1455,10 @@ class MLXEngine:
             record.update(extra)
         return record
 
-    def save_adapter(self, destination: Path, *, provenance_extra: Mapping[str, Any] | None = None) -> Path:
-        return self._run(lambda: self._save_adapter(destination, provenance_extra))
+    def save_adapter(self, destination: Path, *, origin_extra: Mapping[str, Any] | None = None) -> Path:
+        return self._run(lambda: self._save_adapter(destination, origin_extra))
 
-    def _save_adapter(self, destination: Path, provenance_extra: Mapping[str, Any] | None = None) -> Path:
+    def _save_adapter(self, destination: Path, origin_extra: Mapping[str, Any] | None = None) -> Path:
         """Write the adapter atomically: readers see the old one or the new one.
 
         Everything is written into a sibling directory, fsynced, and renamed
@@ -1486,10 +1486,8 @@ class MLXEngine:
                 ),
                 encoding="utf-8",
             )
-            (staging / PROVENANCE).write_text(
-                json.dumps(self.provenance(extra=provenance_extra), indent=2), encoding="utf-8"
-            )
-            for name in (ADAPTER_WEIGHTS, ADAPTER_CONFIG, PROVENANCE):
+            (staging / ORIGIN).write_text(json.dumps(self.origin(extra=origin_extra), indent=2), encoding="utf-8")
+            for name in (ADAPTER_WEIGHTS, ADAPTER_CONFIG, ORIGIN):
                 handle = os.open(staging / name, os.O_RDONLY)
                 try:
                     os.fsync(handle)
@@ -1715,7 +1713,7 @@ class ContinuousBatcher:
 __all__ = [
     "ADAPTER_CONFIG",
     "ADAPTER_WEIGHTS",
-    "PROVENANCE",
+    "ORIGIN",
     "ContinuousBatcher",
     "DistillationRow",
     "MLXEngine",
