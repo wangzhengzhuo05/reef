@@ -39,12 +39,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from reef.train.evaluation import (
-    DefaultCandidateEvaluationPlugin,
-    EvaluationResult,
-    RegressionGate,
-    UpdateCandidate,
-)
+from reef.train.evaluation import DefaultCandidateEvaluationPlugin, EvaluationResult, RegressionGate, UpdateCandidate
 
 logger = logging.getLogger(__name__)
 
