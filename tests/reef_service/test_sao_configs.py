@@ -149,9 +149,10 @@ _MEGATRON_ONLY_FLAGS = frozenset(
 # setting them here makes the generated command testable without a GPU stack.
 _CONFIG_ENV = {
     "REEF_TOKEN": "config-test-token",
+    "REEF_UPSTREAM_URL": "http://127.0.0.1:8000/v1",
+    "REEF_UPSTREAM_MODEL": "config-test-model",
     "TTTD_CHECKPOINT_INTERVAL": "2",
     "TTTD_CUDA_GRAPH_MAX_BS": "8",
-    "TTTD_CUDA_VISIBLE_DEVICES": "0,1",
     "TTTD_GLOBAL_BATCH_SIZE": "8",
     "TTTD_GROUPS_PER_STEP": "2",
     "TTTD_INFERENCE_HOST": "127.0.0.1",
@@ -344,10 +345,12 @@ def test_user_facing_example_deployments_are_discovered() -> None:
     paths = {_config_id(path) for path in EXAMPLE_DEPLOYMENTS}
     assert paths == {
         "recipes/basic/external-provider.yaml",
+        "recipes/coral/examples/coral_demo/serve.yaml",
         "recipes/basic/local-sglang.yaml",
         "recipes/openclawrl/examples/openclawrl/serve.yaml",
         "recipes/openclawrl/examples/openclawrl/results/2026-09-07-gsm8k-stream-qwen3-27b-mlx/serve.yaml",
         "recipes/tttd/examples/guidance_ttt/serve.yaml",
+        "tutorials/harness-requests/configs/deployment.yaml",
         "tutorials/evolve-your-harness/configs/deployment.yaml",
         "tutorials/evolve-your-harness/configs/serve-native.yaml",
         "tutorials/evolve-your-harness/configs/serve.yaml",

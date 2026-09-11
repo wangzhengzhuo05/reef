@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from reef.records import RecordRetention
+from reef.service.cors import console_origins
 from reef.service.deploy.config import config_value, interpolate_config, load_config
 
 _DESCRIPTION = """reef serve — start a stack from a config.
@@ -81,6 +83,7 @@ class ServiceSettings:
     #: timeouts, staleness) are supplied by the service and cannot be
     #: overridden here.
     runtime_config: Mapping[str, Any] = field(default_factory=dict)
+    console_origins: tuple[str, ...] = ()
     ray_address: str | None = None
     ray_namespace: str = "reef"
     ray_actor_name: str = "reef-train-bridge"
@@ -108,6 +111,8 @@ class ServiceSettings:
     artifact_work_dir: str = ".reef/artifact-work"
     artifact_cache_dir: str = ".reef/artifact-cache"
     agent_record_dir: str = ".reef/agent-record"
+    agent_record_retention_days: float = 7.0
+    agent_record_retention_max_bytes: int = 20 * 1024**3
     allow_implicit_scenario_creation: bool = True
     #: Deployment-level experiment provider settings, sourced from
     #: ``observability.wandb``.
@@ -118,6 +123,9 @@ class ServiceSettings:
     #: The flat ``reef`` config section, interpolated; recipes read their own
     #: config fields from it (see the class docstring).
     recipe_settings: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        RecordRetention(self.agent_record_retention_days, self.agent_record_retention_max_bytes)
 
 
 def _config_service_value(config: Mapping[str, Any], *path: str, default: Any = None, expand: bool = True) -> Any:
@@ -198,6 +206,15 @@ def _service_tokens(config: Mapping[str, Any]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(tokens))
 
 
+def _console_origins(config: Mapping[str, Any]) -> tuple[str, ...]:
+    listed = _config_service_mapping(config, "reef").get("console_origins", ())
+    if isinstance(listed, str) or not isinstance(listed, Sequence):
+        raise ValueError("reef.console_origins must be a list of origins")
+    if not all(isinstance(value, str) for value in listed):
+        raise ValueError("reef.console_origins must contain only origins")
+    return console_origins(tuple(interpolate_config(config, value) for value in listed))
+
+
 def service_settings_from_config(config: Mapping[str, Any]) -> ServiceSettings:
     """Translate the config's ``reef`` section into HTTP service settings."""
     selected_recipe = _config_service_value(config, "reef", "recipe")
@@ -210,6 +227,7 @@ def service_settings_from_config(config: Mapping[str, Any]) -> ServiceSettings:
         host=_config_service_value(config, "reef", "host", default="0.0.0.0"),
         port=int(_config_service_value(config, "reef", "port", default="8900")),
         tokens=_service_tokens(config),
+        console_origins=_console_origins(config),
         recipe=selected_recipe,
         runtime_type=_config_service_value(config, "reef", "runtime_type", default="ray_training"),
         runtime_config=_config_service_mapping(config, "reef", "runtime_config"),
@@ -269,6 +287,12 @@ def service_settings_from_config(config: Mapping[str, Any]) -> ServiceSettings:
             "reef",
             "agent_record_dir",
             default=".reef/agent-record",
+        ),
+        agent_record_retention_days=float(
+            _config_service_value(config, "reef", "agent_record_retention_days", default=7.0)
+        ),
+        agent_record_retention_max_bytes=int(
+            _config_service_value(config, "reef", "agent_record_retention_max_bytes", default=20 * 1024**3)
         ),
         allow_implicit_scenario_creation=bool(
             _config_service_value(config, "reef", "allow_implicit_scenario_creation", default=True)

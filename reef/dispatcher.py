@@ -8,10 +8,12 @@ handling lives in ``reef.service``; the dispatcher is transport-free.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import shutil
 import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -32,6 +34,7 @@ from reef.observability import (
     TrainingExperimentEvent,
 )
 from reef.recipe.base import Recipe
+from reef.records import RecordRetention
 from reef.runtime.base import RuntimeContractError, TrainingRuntime
 from reef.scenario.checkpoint_strategy import CheckpointStrategy, EveryNVersions
 from reef.scenario.registry import ScenarioRegistry
@@ -59,6 +62,10 @@ class _PublicationState:
     def record(self, scenario: str, value: Any) -> None:
         with self.lock:
             self.values[scenario] = value
+
+    def forget(self, scenario: str) -> None:
+        with self.lock:
+            self.values.pop(scenario, None)
 
 
 class _ScenarioTrainingError(Exception):
@@ -89,13 +96,22 @@ class _LifecycleState:
     preload_thread: Thread | None = None
 
 
-def training_request_refusal(text: str) -> str | None:
-    """Why admission refuses an instruction's text; the reason names the rule, never the text."""
-    # The text becomes proposer input and a catalog row, so it meets the screens a promoted task prompt meets.
+def training_request_refusal(text: str, requires: Sequence[Mapping[str, Any]] = ()) -> str | None:
+    """Why admission refuses an instruction; the reason names the rule, never the text or the item.
+
+    The text becomes proposer input and a catalog row, so it meets the
+    screens a promoted task prompt meets; a ``requires`` name or check is
+    shown to the person and recorded in the commit, so it meets them too."""
     if secret_shaped(text):
         return "the request text carries a credential shaped literal; a request never holds secrets"
     if directive_shaped(text):
         return "the request text carries an instruction override phrasing or a chat template control token"
+    for item in requires:
+        for value in (str(item.get("name", "")), str(item.get("check") or "")):
+            if secret_shaped(value):
+                return "a requires item carries a credential shaped literal; a request never holds secrets"
+            if directive_shaped(value):
+                return "a requires item carries an instruction override phrasing or a chat template control token"
     return None
 
 
@@ -134,6 +150,7 @@ class Dispatcher:
         experiment_tracker: ExperimentTracker | None = None,
     ) -> None:
         self._recipe = recipe
+        self._record_retention_lock = Lock()
         self._experiment_tracker = experiment_tracker if experiment_tracker is not None else NullExperimentTracker()
         self._registry = ScenarioRegistry(
             recipe,
@@ -181,6 +198,11 @@ class Dispatcher:
             allow_implicit_creation=allow_implicit_creation,
         )
 
+    def configure_scenario_model(
+        self, scenario: str, model: object, *, create: bool = False, release_id: str | None = None
+    ) -> Scenario:
+        return self._registry.configure_model(scenario, model, create=create, release_id=release_id)
+
     def set_training_mode(self, scenario: str, training_mode: str) -> dict[str, Any]:
         with self._registry.lock_for(scenario):
             current = self._registry.set_training_mode(scenario, training_mode)
@@ -196,12 +218,90 @@ class Dispatcher:
     def list_scenarios(self) -> tuple[dict[str, Any], ...]:
         return self._registry.list()
 
+    def prune_record_archives(self, retention: RecordRetention) -> int:
+        """Apply deployment-wide retention without racing scenario file moves."""
+        with self._record_retention_lock:
+            directory = self._registry.agent_record_dir
+            return 0 if directory is None else retention.prune(directory)
+
+    def delete_scenario(self, scenario: str) -> dict[str, Any]:
+        """Remove a scenario from this deployment and move its own state aside.
+
+        Under the scenario's lock, so no accept or commit interleaves: the
+        training thread and the local worker lose the name, the loaded
+        instance closes, the records and commit log move under
+        ``agent_record_dir/archived``, the recipe's own directories move
+        beside themselves, and the repository registration is archived so
+        the name is free. Artifacts other scenarios share stay.
+        """
+        if "/" in scenario or scenario in ("", ".", ".."):
+            raise UnknownScenario(f"unknown scenario {scenario!r}")
+        with self._record_retention_lock, self._registry.lock_for(scenario):
+            if not self._registry.has(scenario):
+                raise UnknownScenario(f"unknown scenario {scenario!r}")
+            dropped = self._registry.remove(scenario)
+            self._stop_local_backend_worker(scenario)
+            self._publication.forget(scenario)
+            self._record_training_error(scenario, None)
+            if dropped is not None:
+                backend = dropped.trainer.training_backend
+                if backend is not None:
+                    backend.retire_scenario(scenario)
+                dropped.close()
+            archived = [*self._archive_scenario_state(scenario), *self._registry.archive_registration(scenario)]
+        self._registry.forget_lock(scenario)
+        return {"scenario": scenario, "archived": archived}
+
+    def _archive_scenario_state(self, scenario: str) -> list[str]:
+        """Move the scenario's own files and directories under an ``archived`` sibling, stamped so a name can be deleted twice."""
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        moved: list[str] = []
+        record_dir = self._registry.agent_record_dir
+        if record_dir is not None:
+            destination = record_dir / "archived" / f"{hashlib.sha256(scenario.encode('utf-8')).hexdigest()}-{stamp}"
+            for path in self._registry.state_paths(scenario):
+                if path.exists():
+                    destination.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(path), str(destination / path.name))
+                    moved.append(str(destination / path.name))
+        for directory in self._recipe.scenario_state_dirs(scenario):
+            if directory.exists():
+                destination = directory.parent / "archived" / f"{directory.name}-{stamp}"
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(directory), str(destination))
+                moved.append(str(destination))
+        return moved
+
     def recipe_has_files(self) -> bool:
         return self._registry.recipe_has_files()
 
     def list_releases(self, scenario: str) -> tuple[dict[str, Any], ...]:
         with self._registry.lock_for(scenario):
             return self._registry.require(scenario).releases()
+
+    def read_records(self, scenario: str, *, after_sequence: int = 0, limit: int = 50) -> dict[str, Any]:
+        """Read retained summaries without changing the training queue."""
+        from reef.scenario.history import read_records
+
+        with self._registry.lock_for(scenario):
+            return read_records(self._registry.require(scenario), after_sequence=after_sequence, limit=limit)
+
+    def read_record(self, scenario: str, record_id: str) -> dict[str, Any] | None:
+        """Read a retained trace within its scenario, including compacted bodies."""
+        from reef.scenario.history import read_record
+
+        with self._registry.lock_for(scenario):
+            return read_record(self._registry.require(scenario), record_id)
+
+    def read_commits(
+        self, scenario: str, *, after_step: int = 0, limit: int = 50, record_ids: tuple[str, ...] = ()
+    ) -> dict[str, Any]:
+        from reef.scenario.history import read_commits
+
+        with self._registry.lock_for(scenario):
+            return read_commits(
+                self._registry.require(scenario), after_step=after_step, limit=limit, record_ids=record_ids
+            )
 
     def scenario_contract(self, scenario: str) -> dict[str, Any]:
         with self._registry.lock_for(scenario):
@@ -210,6 +310,8 @@ class Dispatcher:
             return {
                 "scenario": scenario,
                 "processor": type(processor).__name__,
+                "training_mode": current.trainer.training_mode,
+                "status": dict(current.trainer.processor_status()),
                 "required_request_types": sorted(rt.value for rt in processor.required_request_types),
             }
 
@@ -281,7 +383,7 @@ class Dispatcher:
             request = TrainingRequest.from_dict(item.payload)
             if item.references:
                 raise ValueError("training instructions do not reference inference receipts")
-            refusal = training_request_refusal(request.text)
+            refusal = training_request_refusal(request.text, request.requires)
             if refusal is not None:
                 raise ValueError(refusal)
         # Schema enforcement: reject a malformed report before it is durably
@@ -414,12 +516,23 @@ class Dispatcher:
                 thread.start()
         worker.ready.set()
 
+    def _stop_local_backend_worker(self, scenario: str) -> None:
+        """Let the scenario's worker thread run out: it re-checks its registration after every wake."""
+        with self._training.lock:
+            worker = self._training.local_workers.pop(scenario, None)
+        if worker is not None:
+            worker.ready.set()
+
+    def _local_backend_worker_registered(self, scenario: str) -> bool:
+        with self._training.lock:
+            return scenario in self._training.local_workers
+
     def _run_local_backend_worker(self, scenario: str, ready: Event) -> None:
         try:
             while True:
                 ready.wait()
                 ready.clear()
-                if self._lifecycle.closed.is_set():
+                if self._lifecycle.closed.is_set() or not self._local_backend_worker_registered(scenario):
                     return
                 self._drain_local_backend(scenario)
         except Exception as exc:
@@ -463,6 +576,9 @@ class Dispatcher:
     def _reload_after_training_failure(self, scenario: str, cause: Exception) -> None:
         current = self._registry.get_optional(scenario)
         if current is None:
+            if not self._registry.has(scenario):
+                # Deleted while its step was in flight: nothing durable to reload.
+                return
             self._registry.reload(scenario)
             return
         self._fail_instruction(current, cause)
@@ -666,7 +782,16 @@ class Dispatcher:
 
     def _set_training_storage_status(self, value: Mapping[str, Any] | None) -> None:
         with self._training.lock:
+            was_blocked = self._training.storage_status is not None
             self._training.storage_status = value
+        if value is not None and not was_blocked:
+            logger.warning(
+                "training is blocked on checkpoint storage: %s; retrying every %.0f seconds until it clears",
+                "; ".join(str(reason) for reason in value.get("reasons", ())) or "no reason reported",
+                self.storage_retry_seconds,
+            )
+        elif value is None and was_blocked:
+            logger.info("checkpoint storage block cleared; training resumes")
 
     @property
     def storage_status(self) -> Mapping[str, Any] | None:

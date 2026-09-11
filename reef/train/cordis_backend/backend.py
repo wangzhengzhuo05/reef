@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import math
 import tarfile
 import tempfile
@@ -24,7 +25,7 @@ from typing import Any
 from reef.artifact.artifact import Artifact
 from reef.harness.adapters.descriptor import AdapterDescriptor
 from reef.harness.episodes.executor import EPISODE_OWNER_LEASE, EpisodeExecutor, LocalExecutor, SandboxExecutor
-from reef.harness.episodes.model_binding import ModelBinding, ModelBindings
+from reef.harness.episodes.model_binding import ModelBinding, ModelBindings, ModelBindingsResolver, usage_of
 from reef.harness.episodes.run import EpisodeError, EpisodeResult, TrajectoryKeepError, run_episode
 from reef.harness.episodes.trajectory import TrajectoryError
 from reef.harness.episodes.vendor_install import install_prefix, resolve_binary
@@ -46,6 +47,7 @@ from reef.train.cordis_backend.manifest import FailureManifest, FailureObservati
 from reef.train.cordis_backend.manifest import FailureRecord as FailureRecord  # re-export: manifest entry type
 from reef.train.cordis_backend.manifest import advance
 from reef.train.cordis_backend.proposals import Proposal, ProposalInbox
+from reef.train.cordis_backend.requests import MAX_REQUIRES, merge_requires, parse_requires
 from reef.train.cordis_backend.strategies import (
     EpisodeScorer,
     Mutation,
@@ -78,20 +80,24 @@ class EpisodeEvaluationWorker:
     def __post_init__(self) -> None:
         self.executor.preflight()
 
-    def run(self, files: Mapping[str, str], task: str, keep_dir: Path | None = None) -> _ScoredEpisode:
+    def run(
+        self, files: Mapping[str, str], task: str, keep_dir: Path | None = None, models: ModelBindings | None = None
+    ) -> _ScoredEpisode:
         if keep_dir is None or not self.transfer_records:
-            return self._run_and_score(files, task, keep_dir)
+            return self._run_and_score(files, task, keep_dir, models)
         # Remote workers must not interpret the driver's path as a local path.
         # Keep the trajectory on the worker, then return it with the scored result.
         with tempfile.TemporaryDirectory(prefix="reef-worker-record-") as temporary:
             record_dir = Path(temporary) / "episode"
-            scored = self._run_and_score(files, task, record_dir)
+            scored = self._run_and_score(files, task, record_dir, models)
             buffer = BytesIO()
             with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
                 archive.add(record_dir, arcname=".")
             return replace(scored, record_archive=buffer.getvalue())
 
-    def _run_and_score(self, files: Mapping[str, str], task: str, keep_dir: Path | None) -> _ScoredEpisode:
+    def _run_and_score(
+        self, files: Mapping[str, str], task: str, keep_dir: Path | None, models: ModelBindings | None
+    ) -> _ScoredEpisode:
         """Score one side's episode; a ``None`` score marks an episode that
         could not run. The observation keeps what the exception handling
         would otherwise discard: the failure's stage and cause. A native turn
@@ -124,11 +130,11 @@ class EpisodeEvaluationWorker:
             return scored
         finally:
             EPISODE_OWNER_LEASE.reset(token)
-        scored = self._score_result(result, task)
+        scored = self._score_result(result, task, models)
         _write_episode_record(keep_dir, task, result, scored)
         return scored
 
-    def _score_result(self, result: EpisodeResult, task: str) -> _ScoredEpisode:
+    def _score_result(self, result: EpisodeResult, task: str, models: ModelBindings | None = None) -> _ScoredEpisode:
         """The score and the observations of an episode that ran."""
         residue = len(result.residue)
         agents = _agent_work(result.trajectory)
@@ -149,7 +155,9 @@ class EpisodeEvaluationWorker:
             # A loop turn walks no graph: the failure names the loop when the root's header does.
             stage = "loop" if _root_header(result.trajectory).get("loop") else "graph"
             return _ScoredEpisode(None, FailureObservation(task=task, stage=stage, cause=cause), residue, agents, path)
-        score = float(self.scorer(task, result))
+        score = float(
+            self.scorer(task, result) if models is None else self.scorer.score_with_models(task, result, models)
+        )
         if not math.isfinite(score):
             raise ValueError(f"episode scorer returned a non-finite score {score!r} for task {task!r}")
         if result.exit_code != 0:
@@ -270,7 +278,7 @@ def _source_of(sample: TraceSample) -> dict[str, Any]:
 
 
 def _screened(prompt: str) -> bool:
-    """Whether a trace prompt fails the ledger's tripwires: a credential, or an instruction override."""
+    """Whether a trace prompt contains a credential or instruction override barred from task records."""
     return secret_shaped(prompt) or directive_shaped(prompt)
 
 
@@ -314,7 +322,8 @@ class _BudgetedBinding(ModelBinding):
     shared counter is a mutable one-element list so every binding in the set
     decrements the same budget; a cap of 0 is no budget. The record is the
     step's list: one entry per call with the model, the request, the reply
-    or the error, and the seconds it took, every text cut at the record cap.
+    or the error, the provider response when available, the seconds it took and the
+    ``usage`` (input and output tokens), every text cut at the record cap.
     """
 
     _inner: ModelBinding
@@ -346,19 +355,30 @@ class _BudgetedBinding(ModelBinding):
         if timeout_s is not None:
             kwargs["timeout_s"] = timeout_s
         entry: dict[str, Any] = {"model": self.model, "messages": _bounded(messages), "params": _bounded(kwargs)}
+        # ``chat`` returns text only; keep the provider response too, including any reasoning it exposed.
+        if isinstance(self._inner, ModelBinding):
+            object.__setattr__(self._inner, "_last_usage", None)
+            object.__setattr__(self._inner, "_last_response", None)
         started = time.monotonic()
         try:
             reply = self._inner.chat(messages, **kwargs)
         except BaseException as exc:
             # The failed call is the step's decision too: the record keeps it before the error propagates.
             entry["error"] = _clip(f"{type(exc).__name__}: {exc}")
-            entry["seconds"] = round(time.monotonic() - started, 3)
-            self._record.append(entry)
             raise
-        entry["reply"] = _clip(reply) if isinstance(reply, str) else _bounded(reply)
-        entry["seconds"] = round(time.monotonic() - started, 3)
-        self._record.append(entry)
-        return reply
+        else:
+            entry["reply"] = _clip(reply) if isinstance(reply, str) else _bounded(reply)
+            return reply
+        finally:
+            # A provider may spend its budget on reasoning and return no final text; retain that response on error too.
+            response = self._inner.last_response() if isinstance(self._inner, ModelBinding) else None
+            if response is not None:
+                entry["response"] = _bounded(response)
+            entry["seconds"] = round(time.monotonic() - started, 3)
+            usage = self._inner.last_usage() if isinstance(self._inner, ModelBinding) else None
+            if usage is not None:
+                entry["usage"] = usage
+            self._record.append(entry)
 
     def complete(self, body: Mapping[str, Any], *, timeout_s: float | None = None) -> dict[str, Any]:
         """A method's raw request goes through the same budget and record as ``chat``: ``body`` in, ``response`` out."""
@@ -375,8 +395,20 @@ class _BudgetedBinding(ModelBinding):
             raise
         entry["response"] = _bounded(response)
         entry["seconds"] = round(time.monotonic() - started, 3)
+        usage = usage_of(response)
+        if usage is not None:
+            entry["usage"] = usage
         self._record.append(entry)
         return response
+
+
+def _proposer_tokens(record: Sequence[Mapping[str, Any]]) -> tuple[int, int]:
+    """Input and output tokens summed over the record's calls that reported usage."""
+    usages = [entry["usage"] for entry in record if isinstance(entry.get("usage"), Mapping)]
+    return (
+        sum(int(usage.get("input_tokens", 0) or 0) for usage in usages),
+        sum(int(usage.get("output_tokens", 0) or 0) for usage in usages),
+    )
 
 
 def _budgeted_bindings(models: ModelBindings, cap: int, record: list[dict[str, Any]]) -> ModelBindings:
@@ -392,7 +424,8 @@ def _budgeted_bindings(models: ModelBindings, cap: int, record: list[dict[str, A
         return _BudgetedBinding(binding, spent, cap, record)
 
     return ModelBindings(
-        served=wrap(models.served), named={name: wrap(models[name]) for name in models if name != "served"}
+        served=wrap(models.served),
+        named={name: wrap(models[name]) for name in models if name != "served"},
     )
 
 
@@ -632,6 +665,7 @@ class CordisBackend(TrainingBackend):
         score_episode: EpisodeScorer,
         tasks: tuple[str, ...],
         models: ModelBindings | ModelBinding,
+        model_resolver: ModelBindingsResolver | None = None,
         binary: str | None = None,
         episode_timeout_s: float = 600.0,
         episode_repeats: int = 1,
@@ -671,6 +705,7 @@ class CordisBackend(TrainingBackend):
         self._score_episode = score_episode
         self._tasks = tasks
         self._models = models
+        self._model_resolver = model_resolver
         # The served binding renders into episodes only. It is resolved once
         # here so an adapter without a matching model_binding refuses boot,
         # not the first step.
@@ -737,6 +772,7 @@ class CordisBackend(TrainingBackend):
         self.proposals = None if proposals_dir is None else ProposalInbox(Path(proposals_dir), max_pending_proposals)
         # Created at boot so an unwritable record path refuses to start, not the first step.
         self._step_record_dir = None if step_record_dir is None else Path(step_record_dir)
+        self._current_step_record: Path | None = None
         if self._step_record_dir is not None:
             try:
                 self._step_record_dir.mkdir(parents=True, exist_ok=True)
@@ -819,8 +855,12 @@ class CordisBackend(TrainingBackend):
         state: Mapping[str, Any],
         scenario_step: int,
     ) -> PreparedStep:
+        self._current_step_record = None
         if not isinstance(batch, TraceBatch):
             raise TypeError(f"harness evolution requires TraceBatch, got {type(batch).__name__}")
+        if self._model_resolver is not None:
+            self._models = self._model_resolver.resolve()
+            self._binding_nodes = self._models.served.compose_nodes(self._descriptor)
         steps = int(state.get("steps", 0)) + 1
         entries = state.get("entries")
         if entries is not None:
@@ -913,6 +953,7 @@ class CordisBackend(TrainingBackend):
             metrics["gate_tasks"] = len(gate_tasks)
             metrics["promoted_tasks"] = len(gate_tasks) - len(self._tasks)
         step_dir = self._claim_step_dir(steps)
+        self._current_step_record = step_dir
         if step_dir is not None:
             metrics["step_record"] = str(step_dir)
         # Re-gate the last-good tree against the published one on cadence or when the served model changed.
@@ -926,6 +967,7 @@ class CordisBackend(TrainingBackend):
             # A recheck asks the proposer nothing, so its record holds episodes only.
             metrics["proposer_calls"] = 0
             metrics["proposer_seconds"] = 0.0
+            metrics["proposer_input_tokens"] = metrics["proposer_output_tokens"] = 0
             return PreparedStep.with_candidate(
                 HarnessCandidate(
                     candidate_id=f"{batch.batch_id}:recheck",
@@ -960,6 +1002,7 @@ class CordisBackend(TrainingBackend):
             self._write_record(step_dir, RECORD_PROPOSER_FILE, record)
             metrics["proposer_calls"] = 0
             metrics["proposer_seconds"] = 0.0
+            metrics["proposer_input_tokens"] = metrics["proposer_output_tokens"] = 0
             try:
                 mutations = _proposal_mutations(claimed)
             except MutationError as error:
@@ -975,10 +1018,13 @@ class CordisBackend(TrainingBackend):
                 extra["rejected"] = tuple(rejected)
             if self._propose_accepts_sources:
                 extra["sources"] = tuple(_source_of(sample) for sample in batch.samples)
+            handed: dict[str, Any] | None = None
             if batch.request is not None:
                 if not self._propose.reads_requests:
                     raise ValueError("an instruction step requires a proposer that accepts 'requests'")
-                extra["requests"] = ({"id": batch.request.id, **batch.request.to_dict(), "untrusted": True},)
+                # A fresh dict the method may extend: the requires items it adds join the commit's after the screens.
+                handed = {"id": batch.request.id, **batch.request.to_dict(), "untrusted": True}
+                extra["requests"] = (handed,)
             try:
                 proposal = self._propose(self._nodes(), batch.samples, models, **extra)
             finally:
@@ -986,6 +1032,14 @@ class CordisBackend(TrainingBackend):
                 self._write_record(step_dir, RECORD_PROPOSER_FILE, record)
             metrics["proposer_calls"] = len(record)
             metrics["proposer_seconds"] = round(sum(float(entry.get("seconds", 0.0)) for entry in record), 3)
+            # Recorded, not charged: the platform meters served traffic, the evolve step only counts its own.
+            metrics["proposer_input_tokens"], metrics["proposer_output_tokens"] = _proposer_tokens(record)
+            if batch.request is not None and handed is not None:
+                metrics["training_request"] = {
+                    "id": batch.request.id,
+                    **batch.request.to_dict(),
+                    "requires": _merged_requires(batch.request.requires, handed.get("requires")),
+                }
             mutations = (proposal,) if isinstance(proposal, Mutation) else tuple(proposal or ())
         # The parsed proposal lands before admission, so a refused one is on file too, redacted and clipped
         # like the proposer's traffic: the tree boundary has not seen it yet.
@@ -1212,6 +1266,16 @@ class CordisBackend(TrainingBackend):
             raise TypeError(f"harness evaluation requires HarnessCandidate, got {type(candidate).__name__}")
         return candidate
 
+    def read_step_records(self, directory: str, relative: str | None) -> dict[str, Any]:
+        """Read only this scenario's retained step files."""
+        from reef.train.cordis_backend.record_history import read_step_records
+
+        return read_step_records(self._step_record_dir, directory, relative)
+
+    def failed_step_metrics(self) -> Mapping[str, Any]:
+        """Keep the failed attempt's exact directory when the trainer consumes its instruction after reload."""
+        return {} if self._current_step_record is None else {"step_record": str(self._current_step_record)}
+
     def _claim_step_dir(self, step: int) -> Path | None:
         """Create and return a fresh record directory for ``step``; ``None`` with the record off."""
         if self._step_record_dir is None:
@@ -1242,7 +1306,7 @@ class CordisBackend(TrainingBackend):
         return _agent_work(trajectory)
 
     def _evaluate_pairings(self, pairings):
-        scored = self._evaluation_pool.evaluate(pairings)
+        scored = self._evaluation_pool.evaluate(pairings, models=self._models)
         for pairing, result in zip(pairings, scored, strict=True):
             if result.record_archive is not None:
                 keep_dir = pairing[2]
@@ -1298,6 +1362,54 @@ class CordisBackend(TrainingBackend):
 
     def _load_error(self, id_: str) -> str | None:
         return _load_error(self._loader, id_, self._descriptor)
+
+
+def _proposer_requires(base: Sequence[Mapping[str, Any]], handed: object) -> list[dict[str, Any]]:
+    """The items a proposer added to its request mapping, each under the shape and text screens admission runs.
+
+    An item is the proposer's when its name is not among the person's
+    ``base`` items, wherever the proposer put it; one that is malformed, or
+    whose name or check is credential or directive shaped, is dropped alone
+    and named once in the log, the rest stand and the mutations stand."""
+    log = logging.getLogger(__name__)
+    if handed is None:
+        return []
+    if not isinstance(handed, Sequence) or isinstance(handed, (str, bytes)):
+        log.warning("propose: the requires it added are dropped: not a list")
+        return []
+    names = {str(item.get("name")) for item in base}
+    added: list[dict[str, Any]] = []
+    for item in handed:
+        # The person's items passed admission and the person's copy wins: an edit of one is not the proposer's.
+        if isinstance(item, Mapping) and str(item.get("name")) in names:
+            continue
+        try:
+            (parsed,) = parse_requires([item])
+        except ValueError as error:
+            log.warning("propose: a requires item it added is dropped: %s", error)
+            continue
+        texts = (parsed["name"], str(parsed.get("check") or ""))
+        if any(secret_shaped(text) for text in texts):
+            log.warning("propose: a requires item it added carries a credential shaped literal; dropped")
+            continue
+        if any(directive_shaped(text) for text in texts):
+            log.warning("propose: a requires item it added carries an instruction override phrasing; dropped")
+            continue
+        added.append(parsed)
+    return added
+
+
+def _merged_requires(base: Sequence[Mapping[str, Any]], handed: object) -> list[dict[str, Any]]:
+    """The person's items, then what the proposer added by name, capped at ``MAX_REQUIRES`` naming the dropped."""
+    merged = merge_requires(base, _proposer_requires(base, handed))
+    if len(merged) > MAX_REQUIRES:
+        logging.getLogger(__name__).warning(
+            "propose: requires capped at %d items; dropped: %s",
+            MAX_REQUIRES,
+            ", ".join(str(item["name"]) for item in merged[MAX_REQUIRES:]),
+        )
+        merged = merged[:MAX_REQUIRES]
+    return merged
 
 
 def _proposal_mutations(proposal: Proposal) -> tuple[Mutation, ...]:
@@ -1393,17 +1505,25 @@ def _stage_path(trajectory: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     return path
 
 
+#: The counters a verdict carries per agent; the token pair is what the endpoint reported, zero when it reported none.
+AGENT_COUNTERS = ("turns", "steps", "tool_calls", "tool_errors", "input_tokens", "output_tokens")
+
+
 def _agent_work(trajectory: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, int]]:
-    """Turns, steps, tool calls and tool errors per agent of a native-jsonl trajectory; empty for other formats."""
+    """Turns, steps, tool calls, tool errors and reported tokens per agent of a
+    native-jsonl trajectory; empty for other formats."""
     work: dict[str, dict[str, int]] = {}
     agent: str | None = None
     for event in trajectory:
         type_, data = event.get("type"), event.get("data") or {}
         if type_ == "session":
             agent = str(data.get("agent") or "root")
-            work.setdefault(agent, {"turns": 0, "steps": 0, "tool_calls": 0, "tool_errors": 0})["turns"] += 1
+            work.setdefault(agent, dict.fromkeys(AGENT_COUNTERS, 0))["turns"] += 1
         elif agent is None:
             continue
+        elif type_ in ("assistant/message", "context/compacted") and isinstance(data.get("usage"), Mapping):
+            work[agent]["input_tokens"] += int(data["usage"].get("input_tokens", 0) or 0)
+            work[agent]["output_tokens"] += int(data["usage"].get("output_tokens", 0) or 0)
         elif type_ == "step/start":
             work[agent]["steps"] += 1
         elif type_ == "tool/call":
@@ -1417,9 +1537,9 @@ def _sum_agents(runs: Any) -> dict[str, dict[str, int]]:
     total: dict[str, dict[str, int]] = {}
     for work in runs:
         for agent, counts in work.items():
-            sums = total.setdefault(agent, {"turns": 0, "steps": 0, "tool_calls": 0, "tool_errors": 0})
+            sums = total.setdefault(agent, dict.fromkeys(AGENT_COUNTERS, 0))
             for key, value in counts.items():
-                sums[key] += value
+                sums[key] = sums.get(key, 0) + value
     return {agent: total[agent] for agent in sorted(total)}
 
 

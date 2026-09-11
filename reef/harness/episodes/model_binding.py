@@ -23,7 +23,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 
 from reef.core.errors import ReefError
 from reef.harness.adapters.descriptor import AdapterDescriptor
@@ -52,6 +52,31 @@ class ModelBindingError(ReefError):
         super().__init__(message)
         self.status = status
         self.detail = detail
+
+
+def usage_of(response: Any) -> dict[str, int] | None:
+    """The tokens a response reports, as ``{"input_tokens", "output_tokens"}``
+    whatever the dialect (Chat Completions counts ``prompt_tokens`` /
+    ``completion_tokens``; Messages and Responses count ``input_tokens`` /
+    ``output_tokens``); None when the response carries no usage.
+    """
+
+    usage = response.get("usage") if isinstance(response, Mapping) else None
+    if not isinstance(usage, Mapping):
+        return None
+
+    def count(*keys: str) -> int | None:
+        for key in keys:
+            value = usage.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return int(value)
+        return None
+
+    inputs = count("input_tokens", "prompt_tokens")
+    outputs = count("output_tokens", "completion_tokens")
+    if inputs is None and outputs is None:
+        return None
+    return {"input_tokens": inputs or 0, "output_tokens": outputs or 0}
 
 
 @dataclass(frozen=True)
@@ -194,6 +219,19 @@ class ModelBinding:
             raise ModelBindingError("model endpoint returned non-text content")
         return content
 
+    def last_usage(self) -> dict[str, int] | None:
+        """The tokens the latest ``complete`` reported (``usage_of`` of its response), or None."""
+        return getattr(self, "_last_usage", None)
+
+    def last_response(self) -> dict[str, Any] | None:
+        """The latest ``complete`` response, including provider reasoning when returned.
+
+        ``chat`` still returns only assistant text. A recording wrapper can
+        retain this response without making a second call or losing native
+        provider fields. None before a call or after a failed request.
+        """
+        return getattr(self, "_last_response", None)
+
     def complete(self, body: Mapping[str, Any], *, timeout_s: float | None = None) -> dict[str, Any]:
         """POST one request in the binding's native dialect and return the
         response object: Chat Completions for ``openai``, Responses for
@@ -203,6 +241,8 @@ class ModelBinding:
         way. Prefer :meth:`chat` unless the method needs the raw response.
         """
 
+        object.__setattr__(self, "_last_response", None)
+        object.__setattr__(self, "_last_usage", None)
         request_body = {"model": self.model, **body}
         headers = {"content-type": "application/json"}
         if self.api == "anthropic":
@@ -222,13 +262,18 @@ class ModelBinding:
         )
         try:
             with urllib.request.urlopen(request, timeout=timeout_s or self.timeout_s) as response:
-                if request_body.get("stream"):
-                    if self.api == "anthropic":
-                        return _fold_anthropic_stream(response)
-                    if self.api == "responses":
-                        return _fold_responses_stream(response)
-                    return _fold_stream(response)
-                return json.load(response)
+                if not request_body.get("stream"):
+                    result = json.load(response)
+                elif self.api == "anthropic":
+                    result = _fold_anthropic_stream(response)
+                elif self.api == "responses":
+                    result = _fold_responses_stream(response)
+                else:
+                    result = _fold_stream(response)
+            # The tokens this call reported, for a wrapper of ``chat`` that never sees the response body.
+            object.__setattr__(self, "_last_usage", usage_of(result))
+            object.__setattr__(self, "_last_response", result)
+            return result
         except urllib.error.HTTPError as exc:
             try:
                 detail = exc.read().decode(errors="replace")
@@ -244,8 +289,16 @@ class ModelBinding:
 
     # -- Episode-side rendering ----------------------------------------------
 
-    def compose_nodes(self, descriptor: AdapterDescriptor) -> tuple[tuple[str, Mapping[str, Any]], ...]:
-        """``config`` nodes that point ``descriptor``'s harness at this binding."""
+    def compose_nodes(
+        self, descriptor: AdapterDescriptor, *, models: Sequence[str] = ()
+    ) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+        """``config`` nodes that point ``descriptor``'s harness at this binding.
+
+        ``models`` are further model names the harness may pick from: every
+        template entry that names ``{model}`` (a mapping key or a list item)
+        is repeated once per model, this binding's first, while a plain
+        ``{model}`` elsewhere, the default, stays this binding's.
+        """
 
         templates = descriptor.model_binding.get(self.api)
         if not templates:
@@ -255,7 +308,11 @@ class ModelBinding:
                 f"(declared: {known}); episodes cannot reach a model"
             )
         values = {"base_url": self.base_url, "api_key": self.api_key or NO_KEY_PLACEHOLDER, "model": self.model}
-        return tuple(("config", _substitute(node, values)) for node in templates)
+        choices = [self.model]
+        for name in models:
+            if isinstance(name, str) and name and name not in choices:
+                choices.append(name)
+        return tuple(("config", _substitute(node, values, choices)) for node in templates)
 
 
 @dataclass(frozen=True)
@@ -292,15 +349,46 @@ class ModelBindings(Mapping[str, ModelBinding]):
         return 1 + len(self.named)
 
 
-def _substitute(value: Any, values: Mapping[str, str]) -> Any:
+class ModelBindingsResolver(Protocol):
+    """Freeze the model configuration once for an entire evolution step."""
+
+    def resolve(self) -> ModelBindings: ...
+
+
+def _mentions_model(value: Any) -> bool:
+    if isinstance(value, str):
+        return "{model}" in value
+    if isinstance(value, Mapping):
+        return any(_mentions_model(key) or _mentions_model(item) for key, item in value.items())
+    if isinstance(value, list):
+        return any(_mentions_model(item) for item in value)
+    return False
+
+
+def _substitute(value: Any, values: Mapping[str, str], models: Sequence[str] = ()) -> Any:
+    """Fill ``{placeholders}``; with ``models``, a mapping key or list item naming ``{model}`` is repeated per model."""
     if isinstance(value, str):
         for key, replacement in values.items():
             value = value.replace("{" + key + "}", replacement)
         return value
     if isinstance(value, Mapping):
-        return {_substitute(key, values): _substitute(item, values) for key, item in value.items()}
+        out: dict[Any, Any] = {}
+        for key, item in value.items():
+            if len(models) > 1 and isinstance(key, str) and "{model}" in key:
+                for model in models:
+                    each = {**values, "model": model}
+                    out[_substitute(key, each)] = _substitute(item, each)
+            else:
+                out[_substitute(key, values, models)] = _substitute(item, values, models)
+        return out
     if isinstance(value, list):
-        return [_substitute(item, values) for item in value]
+        out_list: list[Any] = []
+        for item in value:
+            if len(models) > 1 and _mentions_model(item):
+                out_list.extend(_substitute(item, {**values, "model": model}) for model in models)
+            else:
+                out_list.append(_substitute(item, values, models))
+        return out_list
     return value
 
 
@@ -318,6 +406,34 @@ def _sse_payloads(response: Any) -> Iterator[Any]:
             continue
 
 
+def _merge_reasoning_details(details: list[Any], fragments: Sequence[Any]) -> None:
+    """Join provider detail fragments by index (or id), leaving opaque blocks opaque."""
+    for fragment in fragments:
+        if not isinstance(fragment, Mapping):
+            details.append(fragment)
+            continue
+        key = "index" if fragment.get("index") is not None else "id" if fragment.get("id") is not None else None
+        target = next(
+            (
+                item
+                for item in details
+                if isinstance(item, dict) and key is not None and item.get(key) == fragment[key]
+            ),
+            None,
+        )
+        if target is None:
+            details.append(dict(fragment))
+            continue
+        for name, value in fragment.items():
+            if value is None and target.get(name) is not None:
+                continue
+            if name in ("text", "summary", "signature", "data") and isinstance(value, str):
+                previous = target.get(name)
+                target[name] = (previous if isinstance(previous, str) else "") + value
+            else:
+                target[name] = value
+
+
 def _fold_stream(response: Any) -> dict[str, Any]:
     """Fold an SSE chat-completions stream into one response object."""
 
@@ -325,76 +441,121 @@ def _fold_stream(response: Any) -> dict[str, Any]:
     role = "assistant"
     finish_reason = None
     model = None
+    usage: dict[str, Any] | None = None
+    reasoning: dict[str, Any] = {}
     for chunk in _sse_payloads(response):
         model = chunk.get("model", model)
+        if isinstance(chunk.get("usage"), Mapping):
+            usage = dict(chunk["usage"])
         for choice in chunk.get("choices", ()):
             delta = choice.get("delta", {})
             role = delta.get("role", role)
             content = delta.get("content")
             if isinstance(content, str):
                 pieces.append(content)
+            for key in ("reasoning", "reasoning_content", "thinking"):
+                if isinstance(delta.get(key), str):
+                    reasoning[key] = reasoning.get(key, "") + delta[key]
+            if isinstance(delta.get("reasoning_details"), list):
+                _merge_reasoning_details(reasoning.setdefault("reasoning_details", []), delta["reasoning_details"])
             finish_reason = choice.get("finish_reason", finish_reason)
-    return {
+    folded: dict[str, Any] = {
         "object": "chat.completion",
         "model": model,
         "choices": [
             {
                 "index": 0,
-                "message": {"role": role, "content": "".join(pieces)},
+                "message": {"role": role, "content": "".join(pieces), **reasoning},
                 "finish_reason": finish_reason,
             }
         ],
     }
+    if usage is not None:
+        folded["usage"] = usage
+    return folded
 
 
 def _fold_anthropic_stream(response: Any) -> dict[str, Any]:
     """Fold an SSE messages stream into one response object."""
 
-    pieces: list[str] = []
+    blocks: dict[int, dict[str, Any]] = {}
+    partial_inputs: dict[int, str] = {}
     model = None
     stop_reason = None
+    usage: dict[str, Any] = {}
     for event in _sse_payloads(response):
         kind = event.get("type")
         if kind == "message_start":
             model = event.get("message", {}).get("model", model)
+            if isinstance(event.get("message", {}).get("usage"), Mapping):
+                usage.update(event["message"]["usage"])
+        elif kind == "content_block_start" and isinstance(event.get("content_block"), Mapping):
+            blocks[event.get("index", 0)] = dict(event["content_block"])
         elif kind == "content_block_delta":
             delta = event.get("delta", {})
-            if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
-                pieces.append(delta["text"])
+            fields = {"text_delta": "text", "thinking_delta": "thinking", "signature_delta": "signature"}
+            field_name = fields.get(delta.get("type"))
+            if field_name is not None and isinstance(delta.get(field_name), str):
+                block = blocks.setdefault(
+                    event.get("index", 0), {"type": "text" if field_name == "text" else "thinking"}
+                )
+                block[field_name] = str(block.get(field_name, "")) + delta[field_name]
+            elif delta.get("type") == "input_json_delta" and isinstance(delta.get("partial_json"), str):
+                index = event.get("index", 0)
+                partial_inputs[index] = partial_inputs.get(index, "") + delta["partial_json"]
         elif kind == "message_delta":
             stop_reason = event.get("delta", {}).get("stop_reason", stop_reason)
-    return {
+            if isinstance(event.get("usage"), Mapping):
+                usage.update(event["usage"])
+    for index, partial_json in partial_inputs.items():
+        block = blocks.setdefault(index, {"type": "tool_use"})
+        try:
+            block["input"] = json.loads(partial_json)
+        except json.JSONDecodeError:
+            # Preserve an interrupted tool argument as fragments, never the start block's empty input placeholder.
+            block.pop("input", None)
+            block["partial_json"] = partial_json
+    folded: dict[str, Any] = {
         "type": "message",
         "role": "assistant",
         "model": model,
-        "content": [{"type": "text", "text": "".join(pieces)}],
+        "content": [blocks[index] for index in sorted(blocks)],
         "stop_reason": stop_reason,
     }
+    if usage:
+        folded["usage"] = usage
+    return folded
 
 
 def _fold_responses_stream(response: Any) -> dict[str, Any]:
     """Fold an SSE Responses stream into one response object."""
 
     pieces: list[str] = []
+    output: dict[int, dict[str, Any]] = {}
     completed: dict[str, Any] | None = None
     for event in _sse_payloads(response):
         if event.get("type") == "response.output_text.delta" and isinstance(event.get("delta"), str):
             pieces.append(event["delta"])
+        elif event.get("type") == "response.output_item.done" and isinstance(event.get("item"), dict):
+            output[event.get("output_index", len(output))] = event["item"]
         elif event.get("type") == "response.completed" and isinstance(event.get("response"), dict):
             completed = event["response"]
     if completed is not None:
         return completed
-    return {
-        "object": "response",
-        "status": "completed",
-        "output": [
+    items = [output[index] for index in sorted(output)]
+    if not any(item.get("type") == "message" and item.get("role") == "assistant" for item in items):
+        items.append(
             {
                 "type": "message",
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": "".join(pieces)}],
             }
-        ],
+        )
+    return {
+        "object": "response",
+        "status": "completed",
+        "output": items,
     }
 
 
-__all__ = ["MODEL_APIS", "ModelBinding", "ModelBindingError", "ModelBindings"]
+__all__ = ["MODEL_APIS", "ModelBinding", "ModelBindingError", "ModelBindings", "usage_of"]

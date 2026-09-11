@@ -331,8 +331,9 @@ off its file; its header names the ``agent``, its ``turn`` and its ``parent``. A
 ``pre_execute`` hook that answers ``ask`` inside an agent's turn ends the
 turn with outcome ``ask`` instead of an ``APPROVAL_REQUIRED`` error, because
 the parent graph is the one that can answer. The gate's verdict carries
-``candidate_agents`` and ``current_agents``, the turns, steps, tool calls and
-tool errors per agent summed over each side's episodes. It also carries
+``candidate_agents`` and ``current_agents``, the turns, steps, tool calls,
+tool errors and, when the endpoint reported usage, the input and output
+tokens per agent summed over each side's episodes. It also carries
 ``candidate_paths`` and ``current_paths``, one entry per episode in pairing
 order (task by task, then repeat by repeat): the root session's
 ``stage/exit`` stage names in order and the ``turn/end`` reason kind, plus
@@ -405,7 +406,9 @@ null under a graph), and ``agents``; then ``turn/start``, per step
 ``step/start``, ``request/header`` (the
 rendered system prompt and the tool declarations, logged on the first step so
 the log holds everything the model saw), ``assistant/message`` (``content``,
-``tool_calls``, ``finish``), ``tool/call`` (the raw argument string),
+``tool_calls``, ``finish``, optional ``usage``, and the provider
+``reasoning``, ``reasoning_content``, ``reasoning_details`` and ``thinking``
+fields when present), ``tool/call`` (the raw argument string),
 ``tool/result`` (``content``, ``is_error``, ``enforcement``, and on error a
 closed ``code``: ``UNKNOWN_TOOL``, ``INVALID_ARGS``, ``TOOL_FAILED``,
 ``SANDBOX_FAILED``, ``HOOK_DENIED``, ``APPROVAL_REQUIRED``, ``HOOK_BLOCKED``),
@@ -416,11 +419,11 @@ clock), or ``error`` (its ``error`` code ``MODEL_ERROR``, ``LOAD_ERROR``,
 ``GRAPH_ERROR``, ``LOOP_ERROR`` under a ``native_loop``, or ``TURN_ERROR`` in
 the serve form). Arguments are
 validated against the tool's declared
-schema before ``run`` sees them. A result over 20,000 characters is spilled:
-the whole text is written to ``.reef/spill/<step>-<call_id>.txt`` under the
+schema before ``run`` sees them. A result over 20,000 characters is saved to a file:
+the whole text is written to ``.reef/tool-output/<step>-<call_id>.txt`` under the
 workspace, the model reads the head, one marker line naming that file and the
 omitted count, and the last 2,000 characters, and ``tool/result`` carries the
-file in ``meta.spill``. A failed model call logs ``request/error``
+file in ``meta.output_file``. A failed model call logs ``request/error``
 (``attempt`` and the ``MODEL_ERROR`` failure) before the ``request_error``
 event runs. A hook whose decision differs from the layer
 below it logs ``hook/decision`` (``event``, ``step``, ``hook``, ``owned``, and
@@ -460,7 +463,8 @@ shape, to the open turn's session when there is one and else to
 number, the ``prompt`` and the ``cwd``; ``request/header`` repeats whenever
 the prompt or the declarations changed since the last one; a turn the wall
 clock ended has ``turn/end`` with reason ``turn-timeout``. Steps restart at
-1 each turn, so a turn's spill files land under ``.reef/spill/t<turn>/``.
+1 each turn, so a turn's full tool outputs land under
+``.reef/tool-output/t<turn>/``.
 
 The socket protocol is one request per connection, JSON lines, UTF-8, on a
 Unix domain socket at ``native/serve.sock`` (or under ``/tmp`` when that
@@ -475,7 +479,7 @@ turn as written, then ``{"type": "turn/result", "data": {"exit", "session",
 malformed request answers ``{"type": "error", "data": {"message"}}``.
 Turns are served one at a time; a second connection waits. The three self
 tools (``reef/harness/runners/native/selftools.py``) are ``ToolModule`` instances
-built in code with ``host_plane`` set, run in process whatever
+built in code with ``builtin_tool`` set, run in process whatever
 ``REEF_NATIVE_ENFORCE`` says, and registered only under ``--self-tools``;
 a tree entry named like one fails to mount with ``reserved name``.
 
@@ -522,6 +526,12 @@ To connect an agent that has no adapter yet:
 descriptor at load, and the bundled adapters under `reef/harness/adapters/
 <../../reef/harness/adapters>`__ are complete references. A third-party adapter
 registers on the ``reef.harness_adapters`` entry-point group.
+``evolution.client_models`` lists further model names the installed client
+may switch to: the install script repeats every ``model_binding`` template
+entry that names ``{model}`` (a mapping key, a list item) once per model,
+the served model first and still the default, so pi and opencode show them
+in their model pickers. Each call names the model it wants and the service
+proxies it as is.
 ``evolution.version_check: true`` in the recipe config writes an update
 prompt into the tree and ships for ``pi`` only. The
 prompt offers to run the update or skip in interactive mode and prints the
@@ -533,13 +543,20 @@ adapter's schema.
 after the notice: the ``code_extension`` ``reef-requests``
 (`reef/harness/adapters/pi/requests.ts <../../reef/harness/adapters/pi/requests.ts>`__:
 the ``/reef-harness <request>`` command, which files the request with
-``POST /reef/train`` in manual mode, leaves captured receipts available for
-feedback, and registers nothing under ``PI_OFFLINE``) and the
+``POST /reef/train`` (the scenario runs in ``manual`` or ``hybrid``), leaves
+captured receipts available for feedback, and registers nothing under
+``PI_OFFLINE``) and the
 ``skill`` ``reef-pi-extension-api`` (`reef/harness/adapters/pi/pi_extension_api.md
 <../../reef/harness/adapters/pi/pi_extension_api.md>`__, the pi extension
 API reference the service proposer reads before it writes an extension). The
+same extension's second command, ``/reef-versions [step]``, lists the release
+chain with each step's verdict and request, prints a step's page (``GET
+/reef/harness/releases/{step}/page``) and, for a pending release, the promote
+action and a trial install command, and ``/reef-versions <step> promote`` runs
+the promote after a confirmation. The
 agent only asks; the writing happens on the service, where the evolve step
-hands the request to the recipe's ``propose`` and settles it with the step.
+hands the request to the recipe's ``propose`` and the commit records it
+under ``training_request``, the merged ``requires`` list included.
 Asking needs no extension: ``reef-<adapter> harness "<request>"`` is a
 wrapper subcommand on every adapter. The ids ``reef-version-check``,
 ``reef-requests`` and ``reef-pi-extension-api`` are ``RESERVED_ENTRY_IDS`` in
@@ -547,7 +564,20 @@ wrapper subcommand on every adapter. The ids ``reef-version-check``,
 and a recovered state carry them, and admission refuses a mutation that
 creates, updates or removes one, the way native tool names are reserved. An
 evolved extension runs in pi's process with the person's privileges, and
-admission screens its text for credential shaped literals only, so a pi
-deployment should set ``evolution.review_kinds: [code_extension]`` (the
-tutorial's deployment files gain it with the next stage): review is the
-boundary, and a release that touches an extension then waits for a promote.
+admission screens its text for credential shaped literals only, so the
+tutorial's pi deployment
+(``tutorials/evolve-your-harness/configs/deployment.yaml``) sets
+``evolution.review_kinds: [code_extension]`` beside ``requests: true`` and
+``version_check: true``: review is the boundary, and a release that touches
+an extension waits for a promote.
+
+A request handed to ``propose`` under ``requests`` carries ``requires``
+beside its text, what the person said the change needs from their machine
+as ``{name, kind, check}`` items, and the method may add items of the same
+shape to the mapping when the change it wrote needs something of its own
+(the tutorial's proposer asks the served model for a ``{"requires": [...]}``
+object beside the entries); the backend merges them by name into the
+commit's ``training_request.requires`` after the shape and text screens
+admission runs (a bad item of the method's is dropped alone), and the list
+reaches the releases row, the manifest, the install script's refusal and
+``reef-<adapter> setup``, never a check on the service.

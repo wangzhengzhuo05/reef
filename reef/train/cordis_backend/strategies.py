@@ -88,13 +88,25 @@ class Proposer(ABC):
 
     In ``manual`` and ``hybrid`` mode, when an instruction is queued,
     ``requests`` contains exactly one mapping with ``id``, ``text``,
-    ``session``, ``release_id`` and ``untrusted=True``. It is the
+    ``session``, ``release_id``, ``requires`` and ``untrusted=True``. It is the
     instruction that owns this step; ``samples`` is empty in ``manual``, and
     in ``hybrid`` it is what an automatic batch would take next, up to
     ``batch_size`` and possibly none (failing traces in the score window, or
     records under ``batch_policy: records``). The proposer must explicitly name ``requests`` to take
     instructions. It generates mutations against the current tree, then the
     same gate and publication policy used by automatic evolution apply.
+
+    ``requires`` is what the person said the change needs from their
+    machine: a list of ``{name, kind, check}`` items, ``kind`` one of
+    ``permission``, ``env`` or ``service``, ``check`` optional. The mapping
+    is a plain dict the method may extend: when the change it wrote needs
+    something of its own (an extension that reads a variable, say), it
+    adds items of the same shape to ``request["requires"]``, and the
+    backend merges them by name into the commit's
+    ``training_request.requires`` after the same shape and text screens
+    admission runs; the person's items stand as sent, a bad item of the
+    method's is dropped alone, and the mutations still stand. No check
+    ever runs on the service.
     """
 
     @property
@@ -136,6 +148,10 @@ class EpisodeScorer(ABC):
         model lazily in the allocated worker, not while the recipe is built.
         """
         return ExecutionRequirements()
+
+    def score_with_models(self, task: str, result: EpisodeResult, models: ModelBindings) -> float:
+        """Model-based judges override this method and use the supplied bindings."""
+        return self(task, result)
 
 
 def accepts_keyword(fn: Callable[..., Any], name: str) -> bool:
@@ -217,11 +233,16 @@ class _CallableProposer(Proposer):
 class _CallableEpisodeScorer(EpisodeScorer):
     """Adapter wrapping a plain callable as an episode scorer."""
 
-    def __init__(self, fn: Callable[[str, EpisodeResult], float]) -> None:
+    def __init__(self, fn: Callable[..., float]) -> None:
         self._fn = fn
 
     def __call__(self, task: str, result: EpisodeResult) -> float:
         return self._fn(task, result)
+
+    def score_with_models(self, task: str, result: EpisodeResult, models: ModelBindings) -> float:
+        if accepts_keyword(self._fn, "models"):
+            return self._fn(task, result, models=models)
+        return self(task, result)
 
 
 def resolve_proposer(value: object) -> Proposer:

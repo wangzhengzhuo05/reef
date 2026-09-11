@@ -110,6 +110,16 @@ class TrainingBackend(CandidateEvaluator, ABC):
     @abstractmethod
     def initial_state(self) -> Mapping[str, Any]: ...
 
+    def retire_scenario(self, scenario: str) -> None:
+        """The scenario is being deleted: release what the backend holds for it beyond Reef's own state.
+
+        The default releases nothing. A backend that keeps per-scenario
+        residency in a serving engine or publication history in a training job overrides
+        this to let those go; until it does, the deletion is Reef-side only
+        and the engine keeps the scenario's adapter until it is evicted or
+        the group restarts.
+        """
+
     def close(self) -> None:
         """Release resources owned by this backend; safe to call repeatedly."""
         return
@@ -144,6 +154,10 @@ class TrainingBackend(CandidateEvaluator, ABC):
 
     def experiment_config(self) -> Mapping[str, Any]:
         """Non-secret backend identity/config attached to experiment runs."""
+        return {}
+
+    def failed_step_metrics(self) -> Mapping[str, Any]:
+        """Metadata to retain when the current instruction fails before producing a result."""
         return {}
 
     @abstractmethod

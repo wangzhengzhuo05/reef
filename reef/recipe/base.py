@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from reef.core.reports import ReportBase
@@ -23,6 +24,7 @@ from reef.runtime.inference import InferenceBackend
 from reef.runtime.proxy import resolve_proxy_runtime
 from reef.scenario.binding import AcceptAnyArtifact, ArtifactValidator
 from reef.scenario.checkpoint_strategy import CheckpointStrategy, EveryNVersions
+from reef.scenario.model_config import ScenarioModelConfig
 from reef.surface.base import Surface
 from reef.surface.weights import create_weight_surface
 from reef.train.algos.registry import resolve_preparer
@@ -43,12 +45,23 @@ class Recipe:
 
     name: str = "recipe"
     runtime: InferenceRuntime | None = None
+
+    def scenario_state_dirs(self, scenario: str) -> tuple[Path, ...]:
+        """Directories that belong to one scenario alone, archived when the scenario is deleted; none by default."""
+        return ()
+
     checkpoint_strategy: CheckpointStrategy = field(default_factory=lambda: EveryNVersions(1))
     training_mode: str = config_field("auto")
 
     def __post_init__(self) -> None:
         if self.training_mode not in ("auto", "manual", "hybrid"):
             raise ValueError("training_mode must be 'auto', 'manual' or 'hybrid'")
+
+    def with_model_config(self, config: ScenarioModelConfig) -> Recipe:
+        """Bind model settings supplied for this scenario."""
+        if config.runtime is not None and isinstance(self.runtime, TrainingRuntime):
+            raise RecipeConfigError("model overrides require an inference-only runtime")
+        return self
 
     @classmethod
     def from_environment(

@@ -282,8 +282,10 @@ cannot run) counts as one that could not run, whatever its text. When the
 verdict is a rejection, Reef restores the snapshot it took before the
 mutation. Every verdict is recorded in the scenario's commit log together
 with its mutation (op, id and the full options, so a rejected rewrite is
-readable too), both score vectors, how many model calls the proposer made
-and the seconds they took (``proposer_calls``, ``proposer_seconds``), and per
+readable too), both score vectors, how many model calls the proposer made,
+the seconds they took and the tokens the endpoint counted for them
+(``proposer_calls``, ``proposer_seconds``, ``proposer_input_tokens``,
+``proposer_output_tokens``; the tokens are recorded, never charged), and per
 side and task the path each episode took: on the native harness the stage
 names the loop exited in order and the reason its turn ended
 (``candidate_paths`` and ``current_paths``, one ``{stages, reason}`` per
@@ -295,7 +297,8 @@ The commit log holds the verdict; the step record holds what decided it.
 absolute at build, under which each scenario's steps write
 ``<scenario>/<step>/proposer.json``, one entry per model call the proposer
 made: the ``model``, the ``messages`` and ``params`` of a ``chat`` or the
-``body`` of a ``complete``, then the ``reply`` or ``response`` or the
+``body`` of a ``complete``, then the ``reply`` and provider ``response``
+for a built-in ``chat`` binding, the ``response`` for ``complete``, or the
 ``error``, and the ``seconds`` it took; ``<scenario>/<step>/mutations.json``,
 the parsed proposal with its options, written before admission so a refused
 proposal is on file; and ``<scenario>/<step>/episodes/<side>-<task index>/``,
@@ -307,7 +310,19 @@ stderr, the residue, the score, the failure and the stage path, so a scorer
 can be replayed from the record alone. Long text is clipped with a marker
 naming what was dropped, and a credential shaped literal anywhere in the
 record is replaced by ``[redacted credential]``: the record holds what the
-tree boundary has not seen yet. A recheck step asks the proposer nothing, so
+tree boundary has not seen yet. Provider reasoning remains separate from
+the final reply: Chat Completions responses keep ``reasoning``,
+``reasoning_content`` and ``reasoning_details`` as returned; Messages keeps
+thinking content blocks, and Responses keeps reasoning output items.
+Streaming responses retain these fields too. Opaque encrypted blocks and
+signatures are retained as provider data, not converted into readable
+thinking. A provider that returns no reasoning, an older record, or a custom
+text-only binding has none to display; Reef does not reconstruct it.
+A proposer failure keeps its ``step_record`` directory on the instruction's
+failed commit, including after the trainer reloads. A later retry points to
+its own directory. Older failed commits that did not record this link are
+not matched to files by directory order or timestamps.
+A recheck step asks the proposer nothing, so
 it writes ``episodes/`` only and counts zero proposer calls; a step skipped
 on the step cap or the failure streak writes nothing and names no
 ``step_record``. A step directory is never reused: a step retried after a
@@ -439,10 +454,15 @@ the install works before any step has run:
    reef-pi report --score 0 --feedback "missed the empty-token case"
 
 The script installs the pinned agent, writes the tree, writes the agent's
-model binding pointed at the Reef the script came from (the served tree
-itself carries no endpoint or credential; the binding takes its token from
-``REEF_TOKEN`` in your shell when the script runs), and puts a
-``reef-<adapter>`` wrapper (here ``reef-pi``) on your PATH. The wrapper keeps
+model binding pointed at the address the script came from, which behind a
+gateway is the gateway's (Reef reads ``x-forwarded-host`` and
+``x-forwarded-proto`` when a proxy sets them); the served tree itself carries
+no endpoint or credential, and the binding takes its token from
+``REEF_TOKEN`` in your shell when the script runs. It also puts a
+``reef-<adapter>`` wrapper (here ``reef-pi``) on your PATH; the wrapper runs
+through the interpreter that imported reef when the script ran and reads the
+token back from the binding, so the shell that runs it later needs neither
+on its own. The wrapper keeps
 the receipts from a run, so ``report`` only needs the result. Pinning,
 rollback, and the raw manifest routes are in `HTTP API
 <../reference/http-api.rst#harness-artifacts>`__.
@@ -461,7 +481,7 @@ no mode switch there; a scenario in ``auto`` takes asks after a switch to
    reef-pi harness "run the tests before you report a fix as done"
 
 The wrapper submits to ``POST /reef/train`` with the installed release id
-from the sidecar and the oldest pending session's id, or a fresh session id
+from the release metadata file and the oldest pending session's id, or a fresh session id
 when nothing is spooled. A request can execute without inference receipts;
 captured receipts remain available for a later feedback report. Acceptance
 returns a training record id and does not mean the change has passed the
@@ -477,14 +497,75 @@ accept ``requests``. The tutorial's proposer asks the served model for a
 skill, rules entry, command, or extension, using the bundled
 ``reef-pi-extension-api`` skill as its extension reference. The native trainer
 owns request persistence, scheduling, retry and acknowledgement, and records
-``training_request: {id, session, release_id, text}`` in commit metrics.
+``training_request: {id, session, release_id, text, requires}`` in commit
+metrics.
 
 Admission screens the proposed mutations and the gate evaluates them.
 Reef's entries (``reef-version-check``, ``reef-requests``,
-``reef-pi-extension-api``) are reserved ids no proposal may change.
-An evolved extension runs in pi's process with your privileges; use
-``evolution.review_kinds: [code_extension]`` to hold such releases for
-``POST /reef/scenarios/{scenario}/promote`` before installation.
+``reef-pi-extension-api``) are reserved ids no proposal may change. An
+evolved extension runs in pi's process with your privileges, so the
+tutorial's ``configs/deployment.yaml`` sets
+``evolution.review_kinds: [code_extension]`` beside ``requests: true`` and
+``version_check: true``: a release that touches one waits for
+``POST /reef/scenarios/{scenario}/promote`` before any session installs it;
+promote it as shown below. ``configs/serve.yaml`` and
+``configs/serve-native.yaml`` stay in ``auto``, where an ask is refused, and
+set none of the three. ``tutorials/harness-requests/`` runs this path end to
+end on one machine, from the ask to the install and a session on the new
+tree, with a bug fix flow demo, a research loop demo and a measurement of
+which requests won the gate (``./run.sh bugfix``, ``./run.sh research``,
+``./run.sh measure``).
+
+A release can need something from you before it runs. A request may carry
+``requires``, a list of ``{name, kind, check}`` items: ``permission`` (an OS
+permission you grant), ``env`` (a variable you set; the extension reads it
+from the environment, and its value never goes to reef) or ``service`` (an
+account or endpoint you connect), each with an optional ``check``: the
+variable name for ``env``, a shell command that exits 0 once satisfied for
+the other two. The proposer adds items of its own when the extension it
+wrote needs them. A releases row carries what its own change named; the
+manifest carries what the release needs over its whole chain, so a later
+change that names nothing still needs what an earlier one added. The
+install script refuses a release with an item you have not checked off: it
+prints the setup list and the newest release in the chain that requires
+nothing, the one that installs on a machine with nothing set up
+(``?release_id=<id>``), and exits 1 before it installs or writes anything.
+``reef-pi setup`` is the one place a check runs: it lists the
+newest release's items with each check as written, asks ``run it? [y/N]``
+before running a command (``--yes`` answers for scripts), reads a variable
+from your environment without asking, records what passed in the
+``.reef-harness-release`` release metadata file under ``setup`` with the check it stood
+for, and exits 0 once every item is met; ``reef-pi setup --mark <name>``
+checks an item off by hand, and ``reef-pi setup --release <id>`` reads a
+pending release's items, so you check them off before you promote it. An
+item whose check changed since its check off is asked again. On a fresh
+machine install the release the refusal names first (it requires nothing,
+so ``reef-pi`` exists), run ``reef-pi setup`` for the head's list, then
+install the head. Until every item is met the update
+notice prints the setup list instead of offering the install; a session
+that starts on a tree with an unmet item prints the list once and runs
+anyway. Nothing runs a check at install or at session start.
+
+See what a version is with ``/reef-versions`` in a ``reef-pi`` session: one
+line per catalog row, oldest first, with the step, the first eight characters
+of the release id, the verdict (``selected``, ``rejected``, ``skipped``,
+``pending``, ``promoted at step N`` once a later promote serves a pending
+release, else the row's operation: ``creation``, ``promote``, ``rollback`` or
+``recovery``), ``current`` on the served head and the request text the step
+answered. ``/reef-versions <step>`` prints the URL of that step's page,
+``GET /reef/harness/releases/<step>/page``, one self contained HTML page with
+five sections: Why (the request, else the proposal's reason, else a failure
+in the batch), What changed (the mutations; an extension update as a line
+diff against the release it ran on), Verdict (the gate's verdict and numbers,
+and the step record directory when ``evolution.step_record_dir`` is set),
+Setup (what the release needs from you: the step's own items, then those
+carried from earlier steps) and Chain (the parent, this release, and its
+children: the steps gated on it and any promote or rollback made on it; for
+a rejected or skipped step, the head it ran on). For a pending release the
+command also prints the promote curl, a trial install with ``?release_id=``
+that replaces the tree at your install root, and the head's reinstall to
+return to it; ``/reef-versions <step> promote`` runs the promote from the
+TUI after you confirm it.
 
 The native adapter's binary is ``reef-native``, which ships with reef, so
 the install route serves no script for it. Pull the tree with the client,
@@ -503,6 +584,36 @@ with the same five settings the script bakes into ``reef-pi``:
 The wrapper points the loop at its capture proxy through a temp copy of
 the tree, keeps the loop's session log under ``native/sessions`` beside
 the installed tree, and ``report`` works as for any adapter.
+
+Promote a pending release
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A win that touches a kind in ``evolution.review_kinds`` (``code_extension``
+in the tutorial's ``deployment.yaml``) or a ``native_loop`` sits in the
+catalog with ``pending: true`` and is served to no session until you promote
+it. The notice never offers it either: it offers the newest release that is
+not pending, so a pending release shows only under a promote or a trial
+install by id. Find its id in ``GET /reef/harness/releases`` (the newest row
+marked ``pending``), read the change (``?release_id=<id>`` on the install
+route installs that tree for a trial session), and name it to ``POST
+/reef/scenarios/{scenario}/promote``. The answer is the new head with a fresh
+release id, because a promote republishes the tree as a commit of its own;
+the next ``reef-pi`` session offers the update through the notice. Both
+calls name the scenario your install used: the ``x-reef-scenario`` header
+you gave the install command or, without one, the generated name the script
+baked into ``reef-pi`` as ``REEF_HARNESS_SCENARIO``;
+``grep REEF_HARNESS_SCENARIO ./reef-harness/reef-pi`` prints it. The
+deployment listens on port 8901.
+
+.. code:: bash
+
+   curl -sS -H "Authorization: Bearer reef-local" \
+     -H "x-reef-scenario: <scenario>" \
+     http://127.0.0.1:8901/reef/harness/releases    # the row with "pending": true
+   curl -sS -X POST -H "Authorization: Bearer reef-local" \
+     -H "Content-Type: application/json" \
+     -d '{"release_id": "<the pending release id>"}' \
+     http://127.0.0.1:8901/reef/scenarios/<scenario>/promote
 
 Serve the harness as a resident process
 ---------------------------------------
@@ -523,7 +634,7 @@ or at once when no turn is open. No reinstall, no restart.
    python3 -m reef.harness.client.wrapper report --score 1 --feedback "fixed"
 
 ``--tree`` names the pulled tree, the directory that holds ``native/`` and
-the release sidecar. The process boots from ``native/tree.json``, the
+the ``.reef-harness-release`` metadata file. The process boots from ``native/tree.json``, the
 entries list Reef renders into every native release (a tree pulled before
 that file existed runs in the episode form only). It reads the Reef URL and
 the token from ``native/models.json``; ``--reef-url`` and ``REEF_TOKEN``
@@ -560,7 +671,7 @@ module binds no ``run`` at its top level, a hook whose code does not
 import, a kind this reef has no plugin for, a name a self tool owns) is
 rolled back whole before the next step: ``harness/mount-failed`` names the
 release, the entry and the error, and the previous composition keeps
-serving. On success the sidecar and ``native/tree.json`` name the new
+serving. On success the release metadata file and ``native/tree.json`` name the new
 release, so a restart boots from it with ``source: boot``.
 
 With ``--follow pinned`` the process logs ``release/available`` with the
@@ -577,7 +688,7 @@ logs ``harness/mount-failed`` and is retried by the next poll that names
 the head, so a release published between two steps mounts once the steps
 are over.
 
-``--self-tools`` gives the model three host plane tools. The tree cannot
+``--self-tools`` gives the model three built-in tools. The tree cannot
 remove them or take their names, and they are absent in the episode form,
 so a candidate cannot win the gate by calling them:
 
@@ -652,3 +763,8 @@ the model calls. The bundled descriptors cover these agents:
 
 `Harness adapters <../developer-guide/harness-adapters.rst>`__ is the descriptor reference and
 how to connect an agent that has no adapter yet.
+
+.. seealso::
+
+   `Scenario model configuration <scenario-models.rst>`__ explains scenario-specific custom providers for the entire
+   harness evolve model pipeline through Reef API Platform.

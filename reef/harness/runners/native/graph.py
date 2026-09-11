@@ -327,7 +327,7 @@ class Run:
         body: dict[str, Any] = {"messages": self.messages, "max_tokens": loop.MAX_COMPLETION_TOKENS}
         if self.declarations:
             body["tools"] = self.declarations
-        message = loop._request(self.session, self.binding, self.hooks["request_error"], body, step)
+        message, usage = loop._request(self.session, self.binding, self.hooks["request_error"], body, step)
         if message is None:
             raise _Stop(1)
         calls = list(message.get("tool_calls") or [])
@@ -340,6 +340,14 @@ class Run:
                 "content": message.get("content"),
                 "tool_calls": calls,
                 "finish": "tool-calls" if calls else "stop",
+                # Keep only reasoning the provider returned; absent fields stay absent on older/plain models.
+                **{
+                    key: message[key]
+                    for key in ("reasoning", "reasoning_content", "reasoning_details", "thinking")
+                    if key in message
+                },
+                # The tokens the endpoint counted for this step, when it reported them; the verdict sums them per agent.
+                **({"usage": usage} if usage else {}),
             },
         )
         return "tool_calls" if calls else "text"
@@ -359,9 +367,11 @@ class Run:
                 self.end_turn({"kind": "max-tool-calls", "tool_calls": self.max_tool_calls}, "budget")
             self.tool_calls += 1
             self.session.write("tool/call", {"step": step, "call_id": call_id, "name": name, "arguments": raw})
-            # An agent turn's spill carries its turn number, so two turns' step 1 do not share a file.
+            # An agent turn's output path carries its turn number, so two turns' step 1 do not share a file.
             prefix = f"{step}" if self.parent is None else f"t{self.turn}-{step}"
-            spill = self.workdir / loop.SPILL_DIR / f"{prefix}-{re.sub(r'[^A-Za-z0-9_-]', '_', call_id)}.txt"
+            full_output_path = (
+                self.workdir / loop.TOOL_OUTPUT_DIR / f"{prefix}-{re.sub(r'[^A-Za-z0-9_-]', '_', call_id)}.txt"
+            )
 
             def gate(tool: Any, arguments: dict[str, Any], call_id: str = call_id) -> dict[str, Any]:
                 payload = {
@@ -377,7 +387,9 @@ class Run:
                     raise _Escalate(str(decision.get("reason") or f"{tool.name} needs approval"))
                 return decision
 
-            result = loop._invoke(tools, name, raw, self.workdir, spill=spill, gate=gate, enforcer=loop.enforcer)
+            result = loop._invoke(
+                tools, name, raw, self.workdir, full_output_path=full_output_path, gate=gate, enforcer=loop.enforcer
+            )
             payload = {
                 "step": step,
                 "call_id": call_id,
@@ -392,7 +404,7 @@ class Run:
                 self.tool_errors += 1
             # The log says what was enforced on this tool, whether or not the call reached its run.
             called = tools.get(name)
-            # A host plane tool ran in process whatever the enforcer; the log says so.
+            # A built-in tool ran in process whatever the enforcer; the log says so.
             enforcer = loop.enforcer if called is None else loop.enforcer_for(called, loop.enforcer)
             enforcement = enforcer.describe(called)
             self.session.write(
@@ -466,8 +478,10 @@ class Run:
             ],
             "max_tokens": loop.MAX_COMPLETION_TOKENS,
         }
-        message, failure = loop._complete(self.binding, body)
+        message, failure, usage = loop._complete(self.binding, body)
         record: dict[str, Any] = {"step": self.step, "stage": name, "policy": policy, "tokens_before": before}
+        if usage:
+            record["usage"] = usage
         if message is None:
             # The span stays as it was: a summary that did not arrive drops nothing the model saw.
             self.session.write("context/compacted", {**record, "fired": False, "error": failure})

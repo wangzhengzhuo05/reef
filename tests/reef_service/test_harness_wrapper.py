@@ -16,7 +16,7 @@ from unittest.mock import patch
 
 import pytest
 
-from reef.harness.client.wrapper import harness, main, report, run_agent
+from reef.harness.client.wrapper import harness, main, report, run_agent, setup
 
 
 class _Response:
@@ -92,7 +92,7 @@ def _make_fake_opencode(tmp_path: Path) -> Path:
 
 
 def _make_compose(tmp_path: Path, reef_port: int) -> str:
-    """A minimal pi composition directory with models.json pointing at reef."""
+    """A minimal pi composition directory with models.json pointing at reef, under the provider name the install renders."""
     compose = tmp_path / "compose"
     compose.mkdir()
     (compose / "AGENTS.md").write_text("be concise\n")
@@ -100,7 +100,7 @@ def _make_compose(tmp_path: Path, reef_port: int) -> str:
         json.dumps(
             {
                 "providers": {
-                    "qwen": {
+                    "reef": {
                         "api": "openai-completions",
                         "apiKey": "dummy",
                         "baseUrl": f"http://127.0.0.1:{reef_port}/v1",
@@ -351,7 +351,7 @@ def test_per_receipt_report_posts_one_report_for_each_capture(tmp_path) -> None:
 
 @pytest.mark.unit
 def test_report_carries_the_installed_release_as_metadata(tmp_path) -> None:
-    """report reads the sidecar beside the compose dir and stamps the report
+    """report reads the release file beside the compose dir and stamps the report
     with the release the client is running."""
     compose = tmp_path / "reef-harness" / "pi-agent"
     compose.mkdir(parents=True)
@@ -381,7 +381,7 @@ def test_report_carries_the_installed_release_as_metadata(tmp_path) -> None:
 
 @pytest.mark.unit
 def test_run_agent_tags_records_with_the_installed_release(tmp_path) -> None:
-    """run_agent reads the sidecar and sends x-reef-tag-release, so the record
+    """run_agent reads the release file and sends x-reef-tag-release, so the record
     keeps which release answered."""
     from reef.harness.client import wrapper as harness_wrapper
 
@@ -792,6 +792,56 @@ def test_wrapper_normalizes_the_rewritten_url_to_the_templates_suffix(tmp_path) 
 
 
 @pytest.mark.unit
+def test_wrapper_takes_the_token_from_the_binding_when_the_shell_has_none(tmp_path, monkeypatch) -> None:
+    """The install wrote the token at the binding's key path; a later shell needs no REEF_TOKEN, one that sets it
+    still wins, and a second provider's key in the same file is never Reef's, whatever the two are called."""
+    from reef.harness.client.wrapper import _reef_token
+
+    reef = {"api": "openai-completions", "baseUrl": "http://127.0.0.1:8900/v1", "apiKey": "from-binding"}
+    other = {"api": "anthropic-messages", "baseUrl": "https://api.anthropic.com", "apiKey": "other"}
+    compose = _pi_tree(tmp_path, {"providers": {"anthropic": other, "reef": reef}})
+    monkeypatch.delenv("REEF_TOKEN", raising=False)
+    assert _reef_token("pi", compose) == "from-binding"
+    monkeypatch.setenv("REEF_TOKEN", "from-shell")
+    assert _reef_token("pi", compose) == "from-shell"
+    monkeypatch.delenv("REEF_TOKEN")
+    # An install without REEF_TOKEN left Reef's key empty: nothing to send, and never the other provider's key.
+    empty = _pi_tree(tmp_path / "empty", {"providers": {"anthropic": other, "reef": {**reef, "apiKey": ""}}})
+    assert _reef_token("pi", empty) is None
+    assert _reef_token("pi", "") is None
+    # Reef reached by a host named reef, beside a provider that sorts after it: the key path settles it.
+    docker = _pi_tree(
+        tmp_path / "docker",
+        {"providers": {"reef": {**reef, "baseUrl": "http://reef:8900/v1"}, "zai": {**other, "apiKey": "zk"}}},
+    )
+    assert _reef_token("pi", docker) == "from-binding"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("adapter", ["pi", "opencode", "claude", "codex", "dsh", "hermes", "native"])
+def test_wrapper_reads_the_token_back_from_every_adapters_binding(tmp_path, adapter, monkeypatch) -> None:
+    """Every adapter's binding file, in its own format (JSON, TOML, YAML, dotenv), yields the token the install
+    rendered into it, byte for byte, characters a text search would cut at included."""
+    from reef.harness.adapters import get_adapter
+    from reef.harness.client.wrapper import _reef_token
+    from reef.harness.episodes.model_binding import ModelBinding
+    from reef.harness.tree.render import render_composition
+
+    descriptor = get_adapter(adapter)
+    token = "sk-abc,def;g h\"i'j<k>l\\m"
+    monkeypatch.delenv("REEF_TOKEN", raising=False)
+    for api in descriptor.model_binding:
+        reef = ModelBinding(base_url="http://127.0.0.1:8900", model="qwen3-8b", api_key=token, api=api)
+        files = render_composition([("rules", {"text": "Be brief."}), *reef.compose_nodes(descriptor)], descriptor)
+        root = tmp_path / api
+        for relative, text in files.items():
+            (root / relative).parent.mkdir(parents=True, exist_ok=True)
+            (root / relative).write_text(text, encoding="utf-8")
+        _, subdir = descriptor.compose_relocation()
+        assert _reef_token(adapter, str(root / subdir)) == token
+
+
+@pytest.mark.unit
 def test_wrapper_refuses_a_binding_file_that_leaves_the_composition(tmp_path, monkeypatch) -> None:
     from dataclasses import replace
 
@@ -922,10 +972,10 @@ class _FakeReef:
         self._server.shutdown()
 
 
-def _ask_tree(tmp_path: Path, port: int, *, sidecar: bool = True) -> tuple[str, Path]:
-    """A pi composition bound to the reef at ``port``, the release sidecar beside it, and an empty spool directory."""
+def _ask_tree(tmp_path: Path, port: int, *, with_release_file: bool = True) -> tuple[str, Path]:
+    """A pi composition bound to the reef at ``port``, the release file beside it, and an empty spool directory."""
     compose = _make_compose(tmp_path, port)
-    if sidecar:
+    if with_release_file:
         (tmp_path / ".reef-harness-release").write_text(json.dumps({"release_id": "rel-3"}), encoding="utf-8")
     captures = tmp_path / "captures"
     captures.mkdir()
@@ -941,7 +991,7 @@ def _ask_env(captures: Path, compose: str, **extra: str) -> dict[str, str]:
 
 @pytest.mark.unit
 def test_harness_submits_training_and_preserves_the_last_sessions_receipts(tmp_path, capsys) -> None:
-    """Manual training carries session provenance without fabricating feedback."""
+    """Manual training carries the session id without fabricating feedback."""
     reef = _FakeReef({"agent_record_id": "q-1", "scenario": "ask-scenario", "request_type": "train"})
     compose, captures = _ask_tree(tmp_path, reef.port)
     binary = _make_fake_pi(tmp_path, reef.port)
@@ -982,15 +1032,29 @@ def test_harness_without_spooled_receipts_submits_training(tmp_path, capsys) -> 
     assert request["path"] == "/reef/train"
     assert request["body"]["text"] == "read papers first"
     assert request["body"]["release_id"] == "rel-3"
-    assert "authorization" not in request["headers"]
+    assert request["headers"]["authorization"] == "Bearer dummy"  # no REEF_TOKEN in the shell: models.json's apiKey
     out = capsys.readouterr().out
     assert "reef-pi: training request q-2 accepted" in out
     uuid.UUID(request["body"]["session"])
 
 
 @pytest.mark.unit
+def test_run_agent_reaches_reef_with_the_bindings_token_when_the_shell_has_none(tmp_path) -> None:
+    """The proxy and the agent's own extensions carry the token the install wrote, so a plain shell runs the tree."""
+    reef = _FakeReef({"agent_record_id": "q-3", "scenario": "ask-scenario", "request_type": "train"})
+    compose, captures = _ask_tree(tmp_path, reef.port)
+    binary = _make_fake_pi(tmp_path, reef.port)
+    with patch.dict(os.environ, _ask_env(captures, compose), clear=True), contextlib.suppress(SystemExit):
+        run_agent(str(binary), compose, "ask-scenario", "pi", "PI_CODING_AGENT_DIR", ["-p", "hi"])
+    reef.close()
+
+    (call,) = [seen for seen in reef.seen if seen["path"].startswith("/v1/chat/completions")]
+    assert call["headers"]["authorization"] == "Bearer dummy"  # models.json's apiKey, written by the install
+
+
+@pytest.mark.unit
 def test_harness_names_the_session_the_spool_recorded(tmp_path) -> None:
-    """A spool entry supplies provenance and remains available for a later report."""
+    """A saved capture supplies the session id and remains available for a later report."""
     reef = _FakeReef({"agent_record_id": "q-3", "scenario": "ask-scenario", "request_type": "train"})
     compose, captures = _ask_tree(tmp_path, reef.port)
     key = hashlib.sha256(b"ask-scenario").hexdigest()
@@ -1075,12 +1139,12 @@ def test_harness_unreachable_exits_and_keeps_the_spool(tmp_path) -> None:
 
 
 @pytest.mark.unit
-def test_harness_without_the_sidecar_sends_nothing(tmp_path) -> None:
+def test_harness_without_the_release_file_sends_nothing(tmp_path) -> None:
     reef = _FakeReef({"agent_record_id": "q-0", "scenario": "ask-scenario", "request_type": "train"})
-    compose, captures = _ask_tree(tmp_path, reef.port, sidecar=False)
+    compose, captures = _ask_tree(tmp_path, reef.port, with_release_file=False)
     pending = _write_spool_entry(captures, "ask-scenario", "pending")
     with patch.dict(os.environ, _ask_env(captures, compose), clear=True):
-        with pytest.raises(SystemExit, match=r"no \.reef-harness-release sidecar at .*nothing was sent"):
+        with pytest.raises(SystemExit, match=r"no \.reef-harness-release release file at .*nothing was sent"):
             harness("ask-scenario", "pi", compose, "text me")
         with pytest.raises(SystemExit, match="the request is empty"):
             harness("ask-scenario", "pi", compose, "   ")
@@ -1126,3 +1190,347 @@ def test_a_clear_from_the_agent_empties_what_the_wrapper_would_spool() -> None:
         assert proxy.publish_turn() == 0
     finally:
         proxy.stop()
+
+
+# -- reef-<adapter> setup: check off what the newest release requires ---------------------------
+
+
+class _ReleasesReef:
+    """A reef whose GET /reef/harness/releases answers ``rows``; every request is recorded."""
+
+    def __init__(self, rows: list[dict]) -> None:
+        import http.server
+        import threading
+
+        self.seen: list[dict] = []
+        seen = self.seen
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append({"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}})
+                found = self.path == "/reef/harness/releases"
+                raw = json.dumps({"scenario": "setup-scenario", "releases": rows} if found else {}).encode()
+                self.send_response(200 if found else 404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+            def log_message(self, *args):
+                pass
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+        self.port = self._server.server_address[1]
+
+    def close(self) -> None:
+        self._server.shutdown()
+
+
+def _row(release_id: str, requires: list[dict] | None = None, *, pending: bool = False) -> dict:
+    row: dict = {"release_id": release_id, "pending": pending, "current": False, "operation": "training"}
+    if requires is not None:
+        row["metrics"] = {"training_request": {"id": "q-1", "text": "text me", "requires": requires}}
+    return row
+
+
+def _setup_tree(tmp_path: Path, port: int, release_info: dict) -> tuple[str, Path]:
+    """A pi composition bound to the reef at ``port`` with the given release file beside it."""
+    compose = _make_compose(tmp_path, port)
+    path = tmp_path / ".reef-harness-release"
+    path.write_text(json.dumps(release_info, indent=2) + "\n", encoding="utf-8")
+    return compose, path
+
+
+@pytest.mark.unit
+def test_setup_lists_the_head_rows_items_runs_checks_after_yes_and_records_the_check_offs(tmp_path, capsys) -> None:
+    """The newest row that is not pending is the head; ``--yes`` runs each unmet check; a passing one is checked
+    off in the release file, a failing one is not; a later run does not run a checked off item again."""
+    ran = tmp_path / "ran"
+    rows = [
+        _row("v1"),
+        _row(
+            "v2",
+            [
+                {"name": "TWILIO_SID", "kind": "env", "check": "TWILIO_SID"},
+                {"name": "notify", "kind": "permission", "check": f"touch {ran}"},
+                {"name": "twilio", "kind": "service", "check": "exit 3"},
+            ],
+        ),
+        _row("v3", [{"name": "later", "kind": "env"}], pending=True),
+    ]
+    reef = _ReleasesReef(rows)
+    compose, release_file = _setup_tree(tmp_path, reef.port, {"release_id": "v1", "requires": [], "setup": []})
+    env = _ask_env(tmp_path / "captures", compose, REEF_TOKEN="tok", TWILIO_SID="AC123")
+    with patch.dict(os.environ, env, clear=True):
+        assert setup("setup-scenario", "pi", compose, yes=True) == 1
+    assert ran.exists()
+    assert capsys.readouterr().out.splitlines() == [
+        "reef-pi setup: release v2 requires 3 item(s)",
+        "  TWILIO_SID (env): TWILIO_SID",
+        "    met",
+        f"  notify (permission): touch {ran}",
+        "    met",
+        "  twilio (service): exit 3",
+        "    not met (exit 3)",
+        "reef-pi setup: 1 item(s) not met: twilio",
+    ]
+    (call,) = reef.seen
+    assert call["path"] == "/reef/harness/releases"
+    assert call["headers"]["x-reef-scenario"] == "setup-scenario" and call["headers"]["authorization"] == "Bearer tok"
+    record = json.loads(release_file.read_text(encoding="utf-8"))
+    assert [item["name"] for item in record["setup"]] == ["TWILIO_SID", "notify"]
+    assert all(isinstance(item["checked_at"], float) for item in record["setup"])
+    assert record["release_id"] == "v1" and record["requires"] == [] and not list(tmp_path.glob(".*.part"))
+    # Checked off items are not run again; the failing one fails again and the release file is left alone.
+    ran.unlink()
+    before = release_file.read_bytes()
+    with patch.dict(os.environ, env, clear=True):
+        assert setup("setup-scenario", "pi", compose, yes=True) == 1
+    assert not ran.exists() and release_file.read_bytes() == before
+    out = capsys.readouterr().out
+    assert out.count("    met (checked off)") == 2 and "    not met (exit 3)" in out
+    # A check off by hand runs nothing, and with every item met the status is 0.
+    with patch.dict(os.environ, env, clear=True):
+        assert setup("setup-scenario", "pi", compose, marks=("twilio",)) == 0
+    out = capsys.readouterr().out
+    assert "    met (marked by hand)" in out and out.splitlines()[-1].startswith("reef-pi setup: every item is met")
+    assert [item["name"] for item in json.loads(release_file.read_text())["setup"]] == [
+        "TWILIO_SID",
+        "notify",
+        "twilio",
+    ]
+    # An unknown name is refused with the list, and nothing changes.
+    before = release_file.read_bytes()
+    with patch.dict(os.environ, env, clear=True):
+        assert setup("setup-scenario", "pi", compose, marks=("nope",)) == 2
+    err = capsys.readouterr().err
+    assert "no item named nope; release v2 requires TWILIO_SID, notify, twilio" in err
+    assert release_file.read_bytes() == before
+    reef.close()
+
+
+@pytest.mark.unit
+def test_setup_asks_before_running_a_check_and_reads_an_unset_variable_without_asking(tmp_path, capsys) -> None:
+    ran = tmp_path / "ran"
+    rows = [
+        _row("v1"),
+        _row(
+            "v2", [{"name": "notify", "kind": "permission", "check": f"touch {ran}"}, {"name": "SMTP", "kind": "env"}]
+        ),
+    ]
+    reef = _ReleasesReef(rows)
+    compose, release_file = _setup_tree(tmp_path, reef.port, {"release_id": "v1"})
+    env = _ask_env(tmp_path / "captures", compose)
+    env.pop("SMTP", None)
+    with patch.dict(os.environ, env, clear=True), patch("sys.stdin", io.StringIO("n\n")):
+        assert setup("setup-scenario", "pi", compose) == 1
+    assert not ran.exists() and "setup" not in json.loads(release_file.read_text())
+    out = capsys.readouterr().out
+    assert "    run it? [y/N] " in out and "    skipped" in out and "    not set" in out
+    assert out.splitlines()[-1] == "reef-pi setup: 2 item(s) not met: notify, SMTP"
+    # A yes runs it; the variable is read from the environment, its check being its name.
+    with patch.dict(os.environ, {**env, "SMTP": "smtp.example"}, clear=True), patch("sys.stdin", io.StringIO("y\n")):
+        assert setup("setup-scenario", "pi", compose) == 0
+    assert ran.exists()
+    assert [item["name"] for item in json.loads(release_file.read_text())["setup"]] == ["notify", "SMTP"]
+    reef.close()
+
+
+@pytest.mark.unit
+def test_setup_without_a_release_file_a_reef_or_any_item_says_so(tmp_path, capsys) -> None:
+    import socket
+
+    reef = _ReleasesReef([_row("v1"), _row("v2", []), _row("v3", [{"name": "later", "kind": "env"}], pending=True)])
+    compose, _ = _setup_tree(tmp_path, reef.port, {"release_id": "v1"})
+    with patch.dict(os.environ, _ask_env(tmp_path / "captures", compose), clear=True):
+        assert setup("setup-scenario", "pi", compose, yes=True) == 0
+    assert capsys.readouterr().out == "reef-pi setup: release v2 requires nothing\n"
+    reef.close()
+    (tmp_path / ".reef-harness-release").unlink()
+    with (
+        patch.dict(os.environ, _ask_env(tmp_path / "captures", compose), clear=True),
+        pytest.raises(SystemExit, match=r"no \.reef-harness-release release file at .*nowhere to record a check off"),
+    ):
+        setup("setup-scenario", "pi", compose)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    (tmp_path / "down").mkdir()
+    compose, _ = _setup_tree(tmp_path / "down", port, {"release_id": "v1"})
+    with (
+        patch.dict(os.environ, _ask_env(tmp_path / "captures", compose), clear=True),
+        pytest.raises(SystemExit, match=f"reef-pi: reef unreachable at http://127.0.0.1:{port}"),
+    ):
+        setup("setup-scenario", "pi", compose)
+
+
+@pytest.mark.unit
+def test_run_agent_prints_the_unmet_list_once_and_runs_the_session_without_a_check(tmp_path, capsys) -> None:
+    reef = _FakeReef({"agent_record_id": "q-1", "scenario": "ask-scenario", "request_type": "train"})
+    ran = tmp_path / "ran"
+    release_info = {
+        "release_id": "v2",
+        "requires": [
+            {"name": "notify", "kind": "permission", "check": f"touch {ran}"},
+            {"name": "TWILIO_SID", "kind": "env", "check": "TWILIO_SID"},
+        ],
+        "setup": [{"name": "TWILIO_SID", "checked_at": 1.0}],
+    }
+    compose, _ = _setup_tree(tmp_path, reef.port, release_info)
+    binary = _make_fake_pi(tmp_path, reef.port)
+    captures = tmp_path / "captures"
+    captures.mkdir()
+    with patch.dict(os.environ, _ask_env(captures, compose), clear=True), contextlib.suppress(SystemExit):
+        run_agent(str(binary), compose, "ask-scenario", "pi", "PI_CODING_AGENT_DIR", ["-p", "hi"])
+    reef.close()
+    err = capsys.readouterr().err
+    assert err.splitlines() == [
+        "reef-pi: this release requires setup you have not checked off; run reef-pi setup:",
+        f"  notify (permission): touch {ran}",
+    ]
+    assert not ran.exists()
+    # The session ran through the proxy as always: its receipt is spooled.
+    (spooled,) = captures.glob("*.pending.json")
+    assert json.loads(spooled.read_text())["turns"][0]["receipt"] == "ask-receipt"
+
+
+@pytest.mark.unit
+def test_main_dispatches_setup_with_yes_and_marks_and_exits_with_its_status(tmp_path) -> None:
+    called: list[tuple] = []
+    env = {
+        "REEF_HARNESS_BINARY": "fake-pi",
+        "REEF_HARNESS_COMPOSE": str(tmp_path),
+        "REEF_HARNESS_SCENARIO": "setup-scenario",
+        "REEF_HARNESS_ADAPTER": "pi",
+        "REEF_HARNESS_ENV_VAR": "PI_CODING_AGENT_DIR",
+    }
+    with (
+        patch.dict(os.environ, env),
+        patch("reef.harness.client.wrapper.setup", lambda *args, **kwargs: called.append((args, kwargs)) or 1),
+        patch("sys.argv", ["reef-pi", "setup", "--yes", "--mark", "a", "--mark", "b"]),
+        pytest.raises(SystemExit) as exited,
+    ):
+        main()
+    assert exited.value.code == 1
+    assert called == [(("setup-scenario", "pi", str(tmp_path)), {"yes": True, "marks": ("a", "b")})]
+
+
+def _chain_row(release_id: str, parent: str | None, requires: list[dict] | None = None, *, pending: bool = False):
+    return {**_row(release_id, requires, pending=pending), "parent_release_id": parent}
+
+
+@pytest.mark.unit
+def test_setup_reads_the_chains_union_and_release_names_a_pending_row(tmp_path, capsys) -> None:
+    """What a release requires is every item over its chain, as the manifest lists it; ``--release`` names any
+    catalog row, a pending one included; an unknown id, a catalog with nothing served and a row without an id
+    each say what they are, and an unknown ``--mark`` is exit 2 even when nothing is required."""
+    rows = [
+        _chain_row("v1", None),
+        _chain_row("v2", "v1", [{"name": "TWILIO_SID", "kind": "env"}]),
+        _chain_row("v3", "v2", []),
+        _chain_row("v4", "v3", [{"name": "later", "kind": "env", "check": "LATER"}], pending=True),
+    ]
+    reef = _ReleasesReef(rows)
+    compose, release_file = _setup_tree(tmp_path, reef.port, {"release_id": "v1"})
+    env = _ask_env(tmp_path / "captures", compose, TWILIO_SID="AC1", LATER="x")
+    with patch.dict(os.environ, env, clear=True):
+        assert setup("setup-scenario", "pi", compose, yes=True) == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "reef-pi setup: release v3 requires 1 item(s)",
+        "  TWILIO_SID (env)",
+        "    met",
+        "reef-pi setup: every item is met; install the release when the notice offers it",
+    ]
+    # The pending v4 by name: its chain's item, checked off already, and its own.
+    with patch.dict(os.environ, env, clear=True):
+        assert setup("setup-scenario", "pi", compose, yes=True, release="v4") == 0
+    out = capsys.readouterr().out.splitlines()
+    assert out[:5] == [
+        "reef-pi setup: release v4 requires 2 item(s)",
+        "  TWILIO_SID (env)",
+        "    met (checked off)",
+        "  later (env): LATER",
+        "    met",
+    ]
+    assert [item["name"] for item in json.loads(release_file.read_text())["setup"]] == ["TWILIO_SID", "later"]
+    with patch.dict(os.environ, env, clear=True):
+        assert setup("setup-scenario", "pi", compose, release="nope") == 2
+    assert capsys.readouterr().err == "reef-pi setup: no release nope in the catalog\n"
+    reef.close()
+    # Nothing served yet: said so, and there is nothing to check off.
+    reef = _ReleasesReef([_chain_row("v9", None, [{"name": "x", "kind": "env"}], pending=True)])
+    (tmp_path / "waiting").mkdir()
+    compose, _ = _setup_tree(tmp_path / "waiting", reef.port, {"release_id": "v1"})
+    with patch.dict(os.environ, _ask_env(tmp_path / "captures", compose), clear=True):
+        assert setup("setup-scenario", "pi", compose, yes=True) == 0
+    assert capsys.readouterr().out == "reef-pi setup: no served release yet\n"
+    reef.close()
+    # A row without an id prints without one; an unknown mark is refused before the nothing required return.
+    reef = _ReleasesReef([{"pending": False, "operation": "creation", "current": True}])
+    (tmp_path / "bare").mkdir()
+    compose, _ = _setup_tree(tmp_path / "bare", reef.port, {"release_id": "v1"})
+    with patch.dict(os.environ, _ask_env(tmp_path / "captures", compose), clear=True):
+        assert setup("setup-scenario", "pi", compose) == 0
+        assert setup("setup-scenario", "pi", compose, marks=("nope",)) == 2
+    captured = capsys.readouterr()
+    assert captured.out == "reef-pi setup: requires nothing\n"
+    assert captured.err == "reef-pi setup: no item named nope; requires nothing\n"
+    reef.close()
+
+
+@pytest.mark.unit
+def test_setup_runs_an_item_again_when_its_check_changed_since_the_check_off(tmp_path, capsys) -> None:
+    """A check off records the check it stood for: an item whose check differs counts as unmet everywhere the
+    check offs are read, setup runs it again, and the new record carries the new check."""
+    from reef.harness.client.wrapper import _unmet
+
+    ran = tmp_path / "ran"
+    item = {"name": "notify", "kind": "permission", "check": f"touch {ran}"}
+    stale = {"name": "notify", "checked_at": 1.0, "check": "touch elsewhere"}
+    assert _unmet([item], [stale]) == [item]
+    assert _unmet([item], [{**stale, "check": item["check"]}]) == [] and _unmet([item], [{"name": "notify"}]) == []
+    reef = _ReleasesReef([_row("v1"), _row("v2", [item])])
+    compose, release_file = _setup_tree(tmp_path, reef.port, {"release_id": "v1", "setup": [stale]})
+    with patch.dict(os.environ, _ask_env(tmp_path / "captures", compose), clear=True):
+        assert setup("setup-scenario", "pi", compose, yes=True) == 0
+    assert ran.exists()
+    out = capsys.readouterr().out.splitlines()
+    assert out[1:4] == [
+        f"  notify (permission): touch {ran}",
+        "    the check changed since it was checked off",
+        "    met",
+    ]
+    (record,) = json.loads(release_file.read_text())["setup"]
+    assert record["name"] == "notify" and record["check"] == item["check"] and record["checked_at"] != 1.0
+    # Marked by hand, the record carries the item's check too.
+    reef.close()
+    reef = _ReleasesReef([_row("v1"), _row("v2", [{**item, "check": "exit 1"}])])
+    (tmp_path / "marked").mkdir()
+    compose, release_file = _setup_tree(tmp_path / "marked", reef.port, {"release_id": "v1", "setup": [record]})
+    with patch.dict(os.environ, _ask_env(tmp_path / "captures", compose), clear=True):
+        assert setup("setup-scenario", "pi", compose, marks=("notify",)) == 0
+    (record,) = json.loads(release_file.read_text())["setup"]
+    assert record["check"] == "exit 1"
+    reef.close()
+
+
+@pytest.mark.unit
+def test_main_passes_release_to_setup_only_when_named(tmp_path) -> None:
+    called: list[tuple] = []
+    env = {
+        "REEF_HARNESS_BINARY": "fake-pi",
+        "REEF_HARNESS_COMPOSE": str(tmp_path),
+        "REEF_HARNESS_SCENARIO": "setup-scenario",
+        "REEF_HARNESS_ADAPTER": "pi",
+        "REEF_HARNESS_ENV_VAR": "PI_CODING_AGENT_DIR",
+    }
+    with (
+        patch.dict(os.environ, env),
+        patch("reef.harness.client.wrapper.setup", lambda *args, **kwargs: called.append((args, kwargs)) or 0),
+        patch("sys.argv", ["reef-pi", "setup", "--release", "v4"]),
+        pytest.raises(SystemExit) as exited,
+    ):
+        main()
+    assert exited.value.code == 0
+    assert called == [(("setup-scenario", "pi", str(tmp_path)), {"yes": False, "marks": (), "release": "v4"})]

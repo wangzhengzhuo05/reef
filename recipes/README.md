@@ -66,6 +66,17 @@ policy while a frozen external execution model writes verifier-scored
 programs. It demonstrates how to attach an execution model without adding it
 to Reef's training or inference-token capture path.
 
+[CORAL TTT](coral/README.md) runs a
+[CORAL](https://github.com/Human-Agent-Society/CORAL) discovery task — parallel
+coding agents in git worktrees, graded attempts on one problem — with every
+agent call served and attributed through Reef. CORAL's gateway traffic carries
+Reef receipts into an append-only call journal; a watcher reports each
+finalized attempt exactly once with its exact inference references, and
+sibling attempts of one parent commit train as one grouped relative-reward
+step (reusing the TTT-Discover preparer and loss family). Its example is a
+real CORAL task driven by CORAL's own runtime, plus a no-GPU smoke lane that
+runs the whole loop against the production Reef service with a canned model.
+
 [Harness-Evolve quickstart](../tutorials/evolve-your-harness/README.md) runs the smallest skill
 evolution on the harness evolution mechanism: the served model proposes one
 skill mutation over its own failing traffic, gated real episodes on three
@@ -113,5 +124,5 @@ reef, and the metric is the number of sessions before the agent's answers
 match the student's taste. The method (session correlation, PRM judging, the
 hint-conditioned teacher) is the `openclawrl` cookbook package, so the example
 contains only the harness side: the task stream, the Hermes agent wrapper,
-the student sidecar, and the analysis scripts. Its README keeps the learning
+the student service, and the analysis scripts. Its README keeps the learning
 curve and training curves of a complete run.

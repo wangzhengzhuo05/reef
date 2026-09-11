@@ -26,7 +26,8 @@ harness，包括提示词、规则和技能。
 **[快速上手](https://reefinfra.ai/docs/getting-started/quickstart/) |
 [路线图](https://github.com/Human-Agent-Society/reef/issues/25) |
 [发布文章](https://x.com/ao_qu18465/status/2094867930081337730) |
-[加入 Discord](https://discord.gg/5y8e5f937k)**
+[加入 Discord](https://discord.gg/5y8e5f937k) |
+[加入微信群](docs/community/wechat.md)**
 
 </div>
 
@@ -208,7 +209,7 @@ reef serve -c tutorials/evolve-your-harness/configs/deployment.yaml
 
 ```bash
 export REEF_TOKEN="reef-local"   # the script writes it into the installed harness's
-                                 # model binding; keep it exported for `report`
+                                 # model binding, where reef-pi reads it back
 curl -fsS -H "Authorization: Bearer $REEF_TOKEN" \
   'http://localhost:8901/reef/harness/install?adapter=pi' | bash
 reef-pi -p "fix the failing test in auth.py"
@@ -225,6 +226,8 @@ reef-pi report --score 0 --feedback "missed the empty-token case"
 进行评估，仅在候选胜出时才发布。如何自定义任务和评估方式，请参阅
 [教程](tutorials/evolve-your-harness/README.md)。
 
+要用一句话向 harness 提出修改需求，并看到从提出到安装的完整流程，请运行 [harness requests 教程](tutorials/harness-requests/README.md)。
+
 
 ## Recipes 与示例
 
@@ -236,6 +239,7 @@ reef-pi report --score 0 --feedback "missed the empty-token case"
 | 由测试或校验器打分的任务流 | [SAO](https://reefinfra.ai/docs/user-guide/recipes/sao/) | 模型权重 | [示例](recipes/sao/examples/sao/README.md) · [结果](recipes/sao/examples/sao/README.md#results) |
 | 具备可用的下一状态信号、但无显式上报的 Agent 流量 | [OpenClaw-RL](https://reefinfra.ai/docs/user-guide/recipes/openclawrl/) | 模型权重 | [示例](recipes/openclawrl/examples/openclawrl/README.md) |
 | 对同一问题的多次带分尝试 | [TTT-Discover](https://reefinfra.ai/docs/user-guide/recipes/tttd/) | 模型权重 | [示例](recipes/tttd/examples/tttd/README.md) · [结果](recipes/tttd/examples/tttd/README.md#formal-8x64-results) |
+| 多个 coding agent 并行处理同一任务，尝试由 grader 打分（[CORAL](https://github.com/Human-Agent-Society/CORAL)） | [CORAL TTT](recipes/coral/README.md) | 模型权重 | [示例](recipes/coral/README.md#quickstart-2-gpus) |
 | 带分数的代码搜索：引导模型可训练，执行器冻结 | [Guidance-TTT / TTTD](https://reefinfra.ai/docs/user-guide/recipes/tttd/) | 引导模型权重 | [示例](recipes/tttd/examples/guidance_ttt/README.md) · [结果](recipes/tttd/examples/guidance_ttt/results/README.md) |
 | 使用 Agent 反馈进化其技能池 | [SkillClaw](https://reefinfra.ai/docs/user-guide/recipes/skillclaw/) | Harness 技能；无需训练 GPU | [示例](recipes/skillclaw/README.md) |
 | 使用分数和交互记录改进提示词与指令 | [GEPA](https://reefinfra.ai/docs/user-guide/recipes/gepa/) | Harness；模型权重不变 | [示例与结果](recipes/gepa/examples/aime/README.md) |
@@ -272,6 +276,7 @@ reef-pi report --score 0 --feedback "missed the empty-token case"
 你是否也在研究持续自我进化的 Agent？
 
 - 加入 [Discord](https://discord.gg/5y8e5f937k)，分享 recipe、交流实现细节、讨论新功能。
+- 扫码[加入微信群](docs/community/wechat.md)。
 - 在 [GitHub Discussions](https://github.com/orgs/Human-Agent-Society/discussions) 提问、分享想法、与社区交流。
 - 参与开发请从[贡献指南](CONTRIBUTING.md)开始。
 - 设计方案请通过 [RFC issue](https://github.com/Human-Agent-Society/reef/issues/new?template=rfc.yml) 提出。

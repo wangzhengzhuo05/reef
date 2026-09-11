@@ -26,7 +26,8 @@ to train model weights with Slime and SGLang, or improve an agent's harness, inc
 **[Get started](https://reefinfra.ai/docs/getting-started/quickstart/) |
 [Roadmap](https://github.com/Human-Agent-Society/reef/issues/25) |
 [Launch post](https://x.com/ao_qu18465/status/2094867930081337730) |
-[Join Discord](https://discord.gg/5y8e5f937k)**
+[Join Discord](https://discord.gg/5y8e5f937k) |
+[Join WeChat Group](docs/community/wechat.md)**
 
 </div>
 
@@ -215,7 +216,7 @@ In another terminal, install the harness and run a task:
 
 ```bash
 export REEF_TOKEN="reef-local"   # the script writes it into the installed harness's
-                                 # model binding; keep it exported for `report`
+                                 # model binding, where reef-pi reads it back
 curl -fsS -H "Authorization: Bearer $REEF_TOKEN" \
   'http://localhost:8901/reef/harness/install?adapter=pi' | bash
 reef-pi -p "fix the failing test in auth.py"
@@ -234,6 +235,8 @@ current harness on the tutorial's three coding tasks and publishes it only if
 it wins. See the [tutorial](tutorials/evolve-your-harness/README.md) to customize the
 tasks and evaluation.
 
+To ask for a harness change in plain words and see the whole path from the ask to the install, run the [harness requests tutorial](tutorials/harness-requests/README.md).
+
 
 ## Recipes and examples
 
@@ -246,6 +249,7 @@ are selected by dotted class reference, and do not ship in the Reef wheel.
 | A stream of tasks scored by tests or a verifier | [SAO](https://reefinfra.ai/docs/user-guide/recipes/sao/) | Model weights | [Example](recipes/sao/examples/sao/README.md) · [Results](recipes/sao/examples/sao/README.md#results) |
 | Agent traffic with useful next-state signals and no explicit reports | [OpenClaw-RL](https://reefinfra.ai/docs/user-guide/recipes/openclawrl/) | Model weights | [Example](recipes/openclawrl/examples/openclawrl/README.md) |
 | Repeated, scored attempts at one problem | [TTT-Discover](https://reefinfra.ai/docs/user-guide/recipes/tttd/) | Model weights | [Example](recipes/tttd/examples/tttd/README.md) · [Results](recipes/tttd/examples/tttd/README.md#formal-8x64-results) |
+| Parallel coding agents on one task, attempts scored by a grader ([CORAL](https://github.com/Human-Agent-Society/CORAL)) | [CORAL TTT](recipes/coral/README.md) | Model weights | [Example](recipes/coral/README.md#quickstart-2-gpus) |
 | Scored code search with a trainable guidance model and a frozen executor | [Guidance-TTT / TTTD](https://reefinfra.ai/docs/user-guide/recipes/tttd/) | Guidance-model weights | [Example](recipes/tttd/examples/guidance_ttt/README.md) · [Results](recipes/tttd/examples/guidance_ttt/results/README.md) |
 | Agent feedback used to evolve its skill pool | [SkillClaw](https://reefinfra.ai/docs/user-guide/recipes/skillclaw/) | Harness skills; no training GPUs | [Example](recipes/skillclaw/README.md) |
 | Scores and transcripts used to improve prompts and instructions | [GEPA](https://reefinfra.ai/docs/user-guide/recipes/gepa/) | Harness; fixed model weights | [Example and results](recipes/gepa/examples/aime/README.md) |
@@ -283,6 +287,7 @@ The [documentation](https://reefinfra.ai/docs/) is organized in the following or
 Working on continual self-improving agent?
 
 - [Join Discord](https://discord.gg/5y8e5f937k) to share your recipes, ask implementation questions, and discuss new features.
+- [Join the WeChat group](docs/community/wechat.md) by scanning the QR code.
 - Join the [GitHub Discussions](https://github.com/orgs/Human-Agent-Society/discussions) to ask questions, share ideas, and connect with the community.
 - Start contributing with the [contribution guide](CONTRIBUTING.md).
 - Propose designs through an [RFC issue](https://github.com/Human-Agent-Society/reef/issues/new?template=rfc.yml).

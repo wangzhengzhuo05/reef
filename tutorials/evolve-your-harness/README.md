@@ -1,6 +1,6 @@
 # Harness evolution quickstart
 
-This example is the smallest full run of the harness evolution mechanism: the agent harness configuration is a composition tree of nodes, a proposal is one gated tree mutation, and a winning mutation publishes as a versioned artifact any client can pull. The proposer is the served model itself: it reads the current skill nodes and its own failing requests and proposes one skill mutation as a strict JSON object. `evaluate` grades real headless episodes on a small fixed task set by exact final answer, so a proposal only publishes when it makes previously failing tasks pass their episodes.
+This example is the smallest full run of the harness evolution mechanism: the agent harness configuration is a composition tree of nodes, a proposal is one gated tree mutation, and a winning mutation publishes as a versioned artifact any client can pull. The proposer is the served model itself: it reads the current skill nodes and its own failing requests, each with the score and feedback its report carried, and proposes one skill mutation as a strict JSON object. `evaluate` grades real headless episodes on a small fixed task set by exact final answer, so a proposal only publishes when it makes previously failing tasks pass their episodes.
 
 The pinned paper reproduction built on this mechanism lives at `recipes/skillclaw/`.
 ## Directory layout
@@ -37,8 +37,8 @@ evolve-your-harness/
                  samples the native proposer over one failing task and
                  counts what admission lets through, by kind
     replay.py    writes work/replay.html from a run's files: the release
-                 chain, the loop graph replayed from a session, the tool
-                 calls and the process timeline
+                 chain, the loop graph replayed from a session, the session
+                 event log and the process timeline
   pyproject.toml makes harness/ an installable package
 ```
 
@@ -60,7 +60,7 @@ You also need an OpenAI-compatible endpoint for the model under test, and for th
 ./run.sh self     # the same, and the model proposes the change itself through its self tools
 ```
 
-Every run ends by writing `work/replay.html`: the release chain with each step's verdict and tree diff, the loop graph replayed from a session's events, the session's tool calls and the process timeline. Open it in a browser; `python3 run.py replay` rebuilds it from `work/` at any time.
+Every run ends by writing `work/replay.html`: the release chain with each step's verdict and tree diff, the loop graph replayed from a session's events, the session event log and the process timeline. Open it in a browser; `python3 run.py replay` rebuilds it from `work/` at any time.
 
 serve.yaml carries the endpoint (`upstream_url: http://127.0.0.1:8000`, no /v1 suffix) and the model (`qwen3-8b`) as literals; edit them there to point at your own. The model name appears twice, as `model.path` (the name the proposer and the evolve episodes call) and as `upstream_model` (the name served traffic is forwarded under), and run.py's `MODEL` must match; a name the endpoint does not serve fails the proposer's call, and the step records `skipped: no proposal`. The one value serve.yaml does not hold is the provider key: `export REEF_UPSTREAM_API_KEY=...` if your endpoint needs one.
 
@@ -99,7 +99,7 @@ when migrating to the new structure. Conflicting resource values are rejected.
 
 ## Keep a deployment running
 
-Pass the model at startup using `REEF_UPSTREAM_MODEL`; no YAML edit is needed.
+Pass the model at startup using `REEF_UPSTREAM_MODEL`; no YAML edit is needed. `REEF_PROPOSER_TIMEOUT_S` caps one proposer call in seconds (60 for a failure step and 120 for a request by default) and `REEF_PROPOSER_MAX_TOKENS` its reply (2048 and 4096); raise both for a local thinking model, which answers in minutes and spends the reply budget on its reasoning first.
 [deployment.yaml](configs/deployment.yaml) uses the same variable for serving and
 evaluation. From the repository root, after the source installation and with `pi`
 on PATH, replace the model ID and API key below with your provider's values:
@@ -138,6 +138,8 @@ stop and restart `reef serve`, then rerun the harness install command from the r
 README before retrying `reef-pi`. Installation writes the model ID into the local
 harness configuration.
 
+`deployment.yaml` also sets `evolution.requests: true`, `evolution.version_check: true` and `evolution.review_kinds: [code_extension]`: a session asks for a harness change with `reef-pi harness "..."`, or `/reef-harness ...` in the TUI, and needs no mode switch because the deployment runs in `hybrid`; the notice at session start offers the newest release that is not pending; and a win that touches a `code_extension` waits as a pending release, because an evolved extension runs in pi's process with your privileges. A pending release shows only under a promote or a trial install by id. Promote it with `POST /reef/scenarios/{scenario}/promote` and `{"release_id": ...}`, the id of the row marked `pending: true` in `GET /reef/harness/releases`; the curl is under [Promote a pending release](../../docs/user-guide/evolve-your-harness.rst#promote-a-pending-release) in the user guide. `serve.yaml` and `serve-native.yaml` set none of the three: an ask is refused in `auto`, so a seeded command would have nothing to do there.
+
 ## Notebook
 
 `evolve-your-harness.ipynb` walks the same pass cell by cell and manages the service as a subprocess, so one kernel holds the whole loop. Set the endpoint, model, and key in its first code cell; the notebook patches both serve.yaml bindings (the `reef` section's upstream values and the recipe's `model.path`) into `work/serve-notebook.yaml` and materializes the recipe config from the patched text. `run.py` stays the reference implementation of the loop; the notebook mirrors it.
@@ -148,7 +150,7 @@ Pick a model that fails at least one task and still writes the strict JSON mutat
 
 1. `run.sh` copies serve.yaml's recipe sections into `work/recipes/harness_evolve.yaml` and starts Reef. The recipe boots with the seed composition: one starter `answer-style` skill node. The endpoint lives only on serve.yaml's `reef` section (`upstream_url`, `upstream_api_key`, `upstream_model`) and the recipe names its model as `model.path`; Reef hands the endpoint and that name to `propose` as a model binding and renders them into each evaluation episode, so neither the method nor the published tree ever names them.
 2. `run.py` sends each of the three exact-answer coding tasks once through reef inference; reef serves the reply and records the exchange. The reply is graded the same way the evolve gate grades episodes, and the score is reported against the receipt.
-3. Only failures batch (`max_score: 0.0`, the SkillClaw window), and `batch_size: 1` makes every failing report one evolve step: `propose` sends the failing requests and current skills back to the same model through `models.served.chat`, which answers with one skill mutation; the candidate and current compositions each run one episode per task; the mutation publishes only on a gate win.
+3. Only failures batch (`max_score: 0.0`, the SkillClaw window), and `batch_size: 1` makes every failing report one evolve step: `propose` sends the failing requests, each with its report's score and feedback, and the current skills back to the same model through `models.served.chat`, which answers with one skill mutation; the candidate and current compositions each run one episode per task; the mutation publishes only on a gate win.
 4. `run.py` pulls `GET /reef/harness` and prints the gate metrics and the evolved `SKILL.md` files. Point any pi at the pulled tree, with its model set to Reef, and it carries the learned skill.
 
 ## Native variant
@@ -164,7 +166,7 @@ The recorded pass is identical, so the two variants are comparable on the same t
 
 ## Self tools variant
 
-`./run.sh self` is the native variant with `reef-native serve --self-tools`: the served model gets `harness_inspect`, `harness_try` and `harness_propose`, the host plane tools of the resident process. `python3 run.py self` sends one turn that tells the model it runs on a harness it can read and change and asks it to inspect the tree, propose one change through `harness_propose` that makes its answers end with the integer alone on the last line, and then answer the sieve task. The route admits the proposal into the scenario's inbox; the turn's answer is graded and reported, and the failing report opens a step that claims the proposal before it asks the method. A win publishes, the process mounts the release the model proposed (the commit's `proposal` names the proposal and the session that made it), and the first task runs again on the mounted tree. The prompt names the goal and the shape of a rules entry, not the rule's text: what the model writes is what the gate judges.
+`./run.sh self` is the native variant with `reef-native serve --self-tools`: the served model gets `harness_inspect`, `harness_try` and `harness_propose`, the built-in tools of the resident process. `python3 run.py self` sends one turn that tells the model it runs on a harness it can read and change and asks it to inspect the tree, propose one change through `harness_propose` that makes its answers end with the integer alone on the last line, and then answer the sieve task. The route admits the proposal into the scenario's inbox; the turn's answer is graded and reported, and the failing report opens a step that claims the proposal before it asks the method. A win publishes, the process mounts the release the model proposed (the commit's `proposal` names the proposal and the session that made it), and the first task runs again on the mounted tree. The prompt names the goal and the shape of a rules entry, not the rule's text: what the model writes is what the gate judges.
 
 ## Results
 

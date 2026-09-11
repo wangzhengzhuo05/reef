@@ -31,17 +31,17 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Protocol
 
-from reef.harness.episodes.model_binding import ModelBinding, ModelBindingError
+from reef.harness.episodes.model_binding import ModelBinding, ModelBindingError, usage_of
 from reef.harness.runners.native.enforce import Enforcer, InProcessEnforcer, SandboxFailed, ToolFailed, select_enforcer
 from reef.harness.tree.nodes import NATIVE_EVENTS, NATIVE_LOOP_DEFAULT_MAX_STEPS, scope_bindings, validate_native_loop
 
 #: Step and tool result budgets; an episode also runs under the executor's wall clock.
 MAX_STEPS = 12
 MAX_RESULT_CHARS = 20_000
-#: A result over the cap is spilled whole to this directory under the workspace; the model reads the head, a
+#: A result over the cap is saved whole to this directory under the workspace; the model reads the head, a
 #: marker naming the file, and this many characters of tail.
-SPILL_DIR = ".reef/spill"
-SPILL_TAIL_CHARS = 2_000
+TOOL_OUTPUT_DIR = ".reef/tool-output"
+TOOL_OUTPUT_TAIL_CHARS = 2_000
 #: Tokens one model call may generate; a local single slot server stalls every other caller behind an unbounded one.
 MAX_COMPLETION_TOKENS = 4096
 #: Provider attempts one step may spend and the longest wait between them, whatever a request_error hook asks.
@@ -103,7 +103,7 @@ class ToolModule:
         run: ToolRunner,
         capabilities: Sequence[str] = (),
         path: Path | None = None,
-        host_plane: bool = False,
+        builtin_tool: bool = False,
     ) -> None:
         self.name = name
         self.description = description
@@ -115,7 +115,7 @@ class ToolModule:
         self.path = path
         # Reef's own code rather than the tree's (the serve form's self tools): it runs in process whatever
         # enforcer the environment names, since the enforcer confines what a tree entry may do.
-        self.host_plane = host_plane
+        self.builtin_tool = builtin_tool
 
     def declaration(self) -> dict[str, Any]:
         return {
@@ -546,26 +546,29 @@ def _texts(value: Any) -> list[str]:
     return [item for item in value if isinstance(item, str) and item] if isinstance(value, list) else []
 
 
-def _complete(binding: ModelBinding, body: Mapping[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """One provider attempt: the assistant message, or the closed MODEL_ERROR failure."""
+def _complete(
+    binding: ModelBinding, body: Mapping[str, Any]
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None, dict[str, int] | None]:
+    """One provider attempt: the assistant message and the usage it reported, or the closed MODEL_ERROR failure."""
     try:
         response = binding.complete(dict(body))
-        return dict(response["choices"][0]["message"]), None
+        return dict(response["choices"][0]["message"]), None, usage_of(response)
     except (ModelBindingError, KeyError, IndexError, TypeError) as exc:
         failure: dict[str, Any] = {"code": "MODEL_ERROR", "message": f"{type(exc).__name__}: {exc}"[:600]}
         if isinstance(exc, ModelBindingError) and exc.status is not None:
             failure["status"] = exc.status
-        return None, failure
+        return None, failure, None
 
 
 def _request(
     session: Session, binding: ModelBinding, hooks: Sequence[HookModule], body: Mapping[str, Any], step: int
-) -> dict[str, Any] | None:
-    """The step's model call, retried while a request_error hook says so; None once the turn ended in error."""
+) -> tuple[dict[str, Any] | None, dict[str, int] | None]:
+    """The step's model call and the usage it reported, retried while a request_error hook says so;
+    ``(None, None)`` once the turn ended in error."""
     for attempt in range(1, MAX_REQUEST_ATTEMPTS + 1):
-        message, failure = _complete(binding, body)
+        message, failure, usage = _complete(binding, body)
         if failure is None:
-            return message
+            return message, usage
         session.write("request/error", {"step": step, "attempt": attempt, "error": failure})
         action = _decide(session, hooks, "request_error", step, {"step": step, "attempt": attempt, "error": failure})
         if action.get("kind") == "retry" and attempt < MAX_REQUEST_ATTEMPTS:
@@ -575,8 +578,8 @@ def _request(
             )
             continue
         _abort(session, failure, attempts=attempt)
-        return None
-    return None
+        return None, None
+    return None, None
 
 
 def _abort(session: Session, failure: Mapping[str, Any], turn: int = 1, **detail: Any) -> int:
@@ -662,19 +665,19 @@ def run_loop(prompt: str, root: Path, session_dir: Path, workdir: Path) -> int:
         session.close()
 
 
-def _clip(text: str, workdir: Path, spill: Path | None) -> tuple[str, dict[str, Any]]:
-    """What the model reads of a result over the cap: with ``spill``, the whole text lands there and the model gets the head, a marker naming the file, and the tail; without it, the head alone."""
+def _clip(text: str, workdir: Path, full_output_path: Path | None) -> tuple[str, dict[str, Any]]:
+    """What the model reads of a result over the cap: with ``full_output_path``, the whole text lands there and the model gets the head, a marker naming the file, and the tail; without it, the head alone."""
     if len(text) <= MAX_RESULT_CHARS:
         return text, {"truncated": False}
-    if spill is None:
+    if full_output_path is None:
         return text[:MAX_RESULT_CHARS], {"truncated": True}
-    spill.parent.mkdir(parents=True, exist_ok=True)
-    spill.write_text(text, encoding="utf-8")
-    relative = spill.relative_to(workdir).as_posix()
-    tail = text[-SPILL_TAIL_CHARS:]
+    full_output_path.parent.mkdir(parents=True, exist_ok=True)
+    full_output_path.write_text(text, encoding="utf-8")
+    relative = full_output_path.relative_to(workdir).as_posix()
+    tail = text[-TOOL_OUTPUT_TAIL_CHARS:]
     marker = f"\n... [{len(text) - MAX_RESULT_CHARS} characters omitted; the full result is in {relative}] ...\n"
     head = text[: max(0, MAX_RESULT_CHARS - len(marker) - len(tail))]
-    return head + marker + tail, {"truncated": True, "spill": relative}
+    return head + marker + tail, {"truncated": True, "output_file": relative}
 
 
 def _error(code: str, message: str, arguments: Any) -> dict[str, Any]:
@@ -701,8 +704,8 @@ def _refused(decision: Mapping[str, Any], arguments: dict[str, Any]) -> dict[str
 
 
 def enforcer_for(tool: ToolModule, enforcer: Enforcer | None) -> Enforcer:
-    """The enforcer one call runs under: the environment's, except a host plane tool always runs in process."""
-    if tool.host_plane or enforcer is None:
+    """The enforcer one call runs under: the environment's, except a built-in tool always runs in process."""
+    if tool.builtin_tool or enforcer is None:
         return InProcessEnforcer()
     return enforcer
 
@@ -713,7 +716,7 @@ def _invoke(
     raw: str,
     workdir: Path,
     *,
-    spill: Path | None = None,
+    full_output_path: Path | None = None,
     gate: Callable[[ToolModule, dict[str, Any]], Mapping[str, Any]] | None = None,
     enforcer: Enforcer | None = None,
 ) -> dict[str, Any]:
@@ -754,7 +757,7 @@ def _invoke(
     except Exception as exc:
         return _error("TOOL_FAILED", f"{type(exc).__name__}: {exc}", arguments)
     text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
-    content, clipped = _clip(text, workdir, spill)
+    content, clipped = _clip(text, workdir, full_output_path)
     return {
         "content": content,
         "is_error": False,
@@ -766,7 +769,7 @@ def _invoke(
 class _Loop:
     """What the stage handlers reach of this module: the session, the root, and the loop's own helpers."""
 
-    SPILL_DIR = SPILL_DIR
+    TOOL_OUTPUT_DIR = TOOL_OUTPUT_DIR
     MAX_COMPLETION_TOKENS = MAX_COMPLETION_TOKENS
 
     def __init__(

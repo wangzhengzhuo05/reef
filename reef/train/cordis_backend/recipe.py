@@ -14,7 +14,7 @@ from __future__ import annotations
 import importlib
 import warnings
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +33,7 @@ from reef.recipe.config_fields import config_field
 from reef.recipe.errors import RecipeConfigError
 from reef.records import RecordStore
 from reef.runtime.executor.config import ExecutorSettings, WorkerResources, executor_settings, role_executor_settings
+from reef.scenario.model_config import ScenarioModelConfig
 from reef.surface.base import Surface
 from reef.surface.harnesses import create_harness_surface
 from reef.train.cordis_backend.backend import CordisBackend, ScoreComparisonSelector, tree_files
@@ -54,6 +55,19 @@ _CANDIDATE_SELECTORS: dict[str, CandidateSelector] = {
     "score_comparison": ScoreComparisonSelector(),
     "always": AlwaysSelect(),
 }
+
+
+@dataclass(frozen=True)
+class _ScenarioModels:
+    config: ScenarioModelConfig
+    recipe: CordisRecipe
+
+    def resolve(self) -> ModelBindings:
+        runtime = self.config.runtime
+        if runtime is None:
+            return self.recipe.default_model_bindings()
+        served = ModelBinding.from_runtime(runtime)
+        return ModelBindings(served=served, named=dict.fromkeys(self.recipe.models, served))
 
 
 def _resolve_callable(value: Any, what: str) -> Any:
@@ -123,6 +137,9 @@ class CordisRecipe(Recipe):
     steps write the proposer's model calls, the parsed proposal and each gate
     episode's trajectory files, so the decision is reconstructible; off by
     default),
+    optional ``client_models`` (further model names the installed client
+    may switch to; the install script renders them into its config beside
+    the served model, which stays the default),
     and optional ``version_check``
     (``true`` appends the adapter's shipped update notice extension to the
     seed, so every pulled tree tells its user at startup when it is behind
@@ -193,6 +210,8 @@ class CordisRecipe(Recipe):
     min_win_margin: int = 0
     publish: str = "auto"
     review_kinds: tuple[str, ...] = ()
+    #: Models an installed client may switch to besides the served one, rendered into its config.
+    client_models: tuple[str, ...] = ()
     seed: tuple[Mapping[str, Any], ...] = ()
     model_name: str | None = None
     models: Mapping[str, ModelBinding] = field(default_factory=dict)
@@ -208,6 +227,11 @@ class CordisRecipe(Recipe):
     max_score: float = config_field(0.0)
     batch_policy: str = config_field("reports")
     name: str = field(default="harness_evolve", kw_only=True)
+    scenario_model: ScenarioModelConfig | None = field(default=None, repr=False, kw_only=True)
+
+    def with_model_config(self, config: ScenarioModelConfig) -> CordisRecipe:
+        super().with_model_config(config)
+        return replace(self, scenario_model=config)
 
     @property
     def report_type(self) -> type[ScoredRolloutReport]:
@@ -334,6 +358,11 @@ class CordisRecipe(Recipe):
             raise RecipeConfigError("evolution.review_kinds must be a list of node kind names")
         if not all(isinstance(kind, str) and kind for kind in review_kinds):
             raise RecipeConfigError("evolution.review_kinds must be a list of node kind names")
+        client_models = evolution.get("client_models", ())
+        if isinstance(client_models, str) or not isinstance(client_models, Sequence):
+            raise RecipeConfigError("evolution.client_models must be a list of model names")
+        if not all(isinstance(name, str) and name for name in client_models):
+            raise RecipeConfigError("evolution.client_models must be a list of model names")
         adapter = str(evolution.get("adapter", "pi"))
         version_check = evolution.get("version_check", False)
         if not isinstance(version_check, bool):
@@ -436,6 +465,7 @@ class CordisRecipe(Recipe):
             "max_promoted_per_client": per_client,
             "publish": publish,
             "review_kinds": tuple(review_kinds),
+            "client_models": tuple(client_models),
             "seed": tuple(seed),
             "model_name": model_name if isinstance(model_name, str) and model_name else None,
             "models": models,
@@ -456,15 +486,26 @@ class CordisRecipe(Recipe):
         except ValueError as exc:
             raise RecipeConfigError(str(exc)) from exc
 
-    def model_bindings(self) -> ModelBindings:
-        """What ``propose`` receives: the served model plus ``evolution.models``."""
+    def default_model_bindings(self) -> ModelBindings:
         return ModelBindings(served=self.model_binding(), named=dict(self.models))
+
+    def model_bindings(self) -> ModelBindings:
+        """The scenario's model override, or the recipe's served and named models."""
+        if self.scenario_model is not None:
+            return _ScenarioModels(self.scenario_model, self).resolve()
+        return self.default_model_bindings()
 
     def build_surface(self, scenario: str) -> Surface:
         model = self.model_name or getattr(self.runtime, "model_path", None)
+        client_models = self.client_models
+        override = self.scenario_model.runtime if self.scenario_model is not None else None
+        if override is not None:
+            model = override.model_path
+            client_models = ()
         return create_harness_surface(
             seed_entries=tuple(dict(entry) for entry in self.seed),
             served_model=model if isinstance(model, str) and model else None,
+            client_models=client_models,
         )
 
     def base_artifact_files(self) -> Mapping[str, str] | None:
@@ -474,6 +515,13 @@ class CordisRecipe(Recipe):
         descriptor = get_adapter(self.adapter)
         nodes = tuple((str(entry["name"]), entry.get("config")) for entry in self.seed if not entry.get("disabled"))
         return {**render_composition(nodes, descriptor), **tree_files(descriptor, self.seed)}
+
+    def scenario_state_dirs(self, scenario: str) -> tuple[Path, ...]:
+        """The scenario's proposal inbox and its step records: what a delete archives beside the record store."""
+        dirs = [self.proposals_path(scenario)]
+        if self.step_record_dir is not None:
+            dirs.append(Path(self.step_record_dir).expanduser().resolve() / scenario)
+        return tuple(dirs)
 
     def proposals_path(self, scenario: str) -> Path:
         """The scenario's proposal inbox: ``proposals_dir`` made absolute, one directory per scenario under it."""
@@ -488,6 +536,8 @@ class CordisRecipe(Recipe):
         experiment_logger: ExperimentLogger | None = None,
     ) -> Trainer:
         kwargs = self._backend_kwargs()
+        if self.scenario_model is not None:
+            kwargs["model_resolver"] = _ScenarioModels(self.scenario_model, self)
         # One recipe serves many scenarios, so each scenario's steps record under their own directory; absolute,
         # so the path a commit record names resolves from any working directory.
         if kwargs["step_record_dir"] is not None:

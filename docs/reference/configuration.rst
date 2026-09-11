@@ -26,10 +26,23 @@ a bare ``--model_path /models/demo`` targets the ``reef`` section, and a dotted
 ``--training.checkpoint_dir /tmp/ckpt`` targets any other. Each process writes a
 log under ``/tmp/reef-stack/``; set ``run_dir`` to move it.
 
+Use ``${VAR:?}`` for a required environment variable, for example
+``upstream_model: ${REEF_UPSTREAM_MODEL:?}``. If it is unset, empty, or only
+whitespace, Reef reports the missing variable names and their config fields
+before downloading models or starting processes. Command-line overrides are
+applied before this check, so ``--upstream_model <model-id>`` can supply the
+value instead. Plain ``${VAR}`` keeps resolving to an empty string when unset;
+use it for optional values such as an API key for a provider without authentication.
+
 ``REEF_PYTHON`` defaults to the interpreter that launched ``reef serve`` and
 can be overridden in the environment. Use it when a service must share Reef's
 Python environment. A literal ``python`` keeps its normal meaning and is
 resolved from that service's ``PATH``; Reef never rewrites command names.
+
+Scenario-specific model settings are supplied through the existing scenario
+create/update API. See `Scenario model configuration <../user-guide/scenario-models.rst>`__
+for model selection, persistence and platform upgrades. Omitting the model
+setting preserves deployment-wide configuration.
 
 Start from a cookbook stack
 ---------------------------
@@ -68,6 +81,7 @@ The ``reef`` section
    reef.recipe | the recipe this deployment serves. Required.
    reef.host | 0.0.0.0 | bind address
    reef.port | 8900 | bind port
+   reef.console_origins | [] | exact browser console origins allowed to access the HTTP service; disabled by default
    reef.token | the bearer token the service accepts. Use ``tokens: [...]`` to accept several while rotating.
    reef.model_path | a local HF model directory or a repo id, downloaded on start
    reef.upstream_url | the OpenAI-compatible provider, with no ``/v1`` suffix
@@ -89,11 +103,41 @@ persistent.
    reef.artifact_work_dir | .reef/artifact-work | materialization scratch
    reef.artifact_cache_dir | .reef/artifact-cache | fetched artifact cache
    reef.agent_record_dir | .reef/agent-record | the record store
+   reef.agent_record_retention_days | 7.0 | compacted trace bodies expire this many days after compaction
+   reef.agent_record_retention_max_bytes | 21474836480 | 20 GiB shared across compacted trace bodies in the record directory
 
 .. warning::
 
    On ephemeral storage, a restart loses the record store, the commit logs, and
    every version.
+
+The record store keeps trace bodies after training compaction. Compaction marks
+records as retired from training; it does not remove their requests, responses,
+or feedback from SQLite immediately. The HTTP service starts retention cleanup
+at startup and repeats it every 60 seconds, outside the inference and training
+request paths. It first removes bodies older than 7 days, then the oldest
+remaining bodies until their total fits within 20 GiB. Both limits are
+configurable above and must be positive; the time limit must also be finite.
+
+The byte budget counts UTF-8 JSON payloads, references, and artifact references
+across all scenario databases, including databases under ``archived/``. It is
+shared across the directory, not allocated separately to each scenario. Deletes
+commit in batches of 256. Active records, retry hashes, and commit/receipt
+metadata are retained. Cleanup failures are logged and retried on the next sweep.
+
+This is a retained-body budget, not a hard disk quota. Incoming compaction can
+exceed the budget between sweeps; active records, indexes, hashes, commit logs,
+and WAL files take additional space. SQLite reuses pages freed by cleanup but
+does not automatically shrink the database file. Allow additional disk headroom.
+Standalone Python stores do not start a maintenance task; see `Python API <python-api.rst>`__
+for explicit retention and purge methods.
+
+Existing stores gain ``compacted_at`` and ``body_bytes`` columns when opened.
+The migration measures retained JSON byte sizes once. Already
+deleted bodies cannot be recovered by this migration. Older Reef versions do
+not filter that column: stop the service and restore a pre-upgrade backup for
+rollback, or purge all compacted bodies with the new version before downgrading.
+Do not share a migrated store between old and new writers.
 
 Recipe settings such as ``batch_size`` sit beside these in the same section,
 along with any others the recipe declares with ``config_field``. When
@@ -304,10 +348,10 @@ zero.
    evolution.seed | entry options loaded into the tree on first boot, or a dotted ``module:attribute`` naming a sequence of them (``reef.harness.runners.native.seed:SEED_NODES`` is the native harness's shipped tools and hook); recovered state takes precedence
    evolution.models | auxiliary models for the method: ``url``, ``model``, optional ``api`` (default ``openai``) and ``timeout_s``, with the credential as a literal ``api_key`` or an ``api_key_env`` variable name
    evolution.version_check | appends the adapter's update notice; an interactive pulled tree offers to run the update or skip when behind
-   evolution.requests | false | appends the adapter's harness requests extension and its extension API skill after the notice (the reserved entries ``reef-requests`` and ``reef-pi-extension-api``), so a ``reef-pi`` session gets ``/reef-harness <request>`` in the TUI (submits to ``POST /reef/train``, which needs ``data.training_mode: hybrid`` or ``manual``) and the method reads the API reference before it writes an extension; ``pi`` only, other adapters refuse boot (a seed entry: a deployment that boots from a recovered state keeps its tree, as with ``version_check``)
+   evolution.requests | false | appends the adapter's harness requests extension and its extension API skill after the notice (the reserved entries ``reef-requests`` and ``reef-pi-extension-api``), so a ``reef-pi`` session gets ``/reef-harness <request>`` in the TUI (submits to ``POST /reef/train``, which needs ``data.training_mode: hybrid`` or ``manual``) and the method reads the API reference before it writes an extension; ``pi`` only, other adapters refuse boot (a seed entry: a deployment that boots from a recovered state keeps its tree, as with ``version_check``); the tutorial's ``tutorials/evolve-your-harness/configs/deployment.yaml`` sets it, with ``version_check: true`` and ``review_kinds: [code_extension]``
    evolution.proposals_dir | .reef/proposals | where agent proposals from ``POST /reef/harness/proposals`` wait for the next evolve step: one directory per scenario under it (``<dir>/<scenario>``, made absolute at build, created when the first proposal arrives), with ``claimed/``, ``refused/`` and ``settled/`` beside the pending files
    evolution.max_pending_proposals | 8 | how many admitted proposals one scenario holds; the route answers ``admitted: false`` with reason ``inbox full`` beyond it, and with reason ``manual mode takes instructions only`` on a scenario in ``data.training_mode: manual``
-   evolution.step_record_dir | | off by default; when set, every step writes its record under ``<dir>/<scenario>/<step>`` (the path is made absolute at build): ``proposer.json`` (each model call the proposer made: ``model``, ``messages`` and ``params`` for a ``chat`` or ``body`` for a ``complete``, then ``reply`` or ``response`` or ``error``, and ``seconds``; long text is clipped with a marker and a credential shaped literal is replaced by ``[redacted credential]``), ``mutations.json`` (the parsed proposal with its full options, refused or not, redacted the same way) and ``episodes/<side>-<task index>/`` (each gate episode's trajectory files as the adapter writes them, copied out of its root before the root is removed, plus ``episode.json`` with the task, the exit code, stdout and stderr, the residue, the score, the failure and the stage path; a repeat adds ``-<repeat>``); a recheck step writes ``episodes/`` only and has no proposer files; a step skipped on the step cap or the failure streak writes nothing; a step directory is never reused, so a retried step lands in ``<step>-2``, then ``<step>-3``; nothing prunes the directory; an unwritable path refuses boot and a record copy that fails aborts the step instead of scoring it
+   evolution.step_record_dir | | off by default; when set, every step writes its record under ``<dir>/<scenario>/<step>`` (the path is made absolute at build): ``proposer.json`` (each model call the proposer made: ``model``, ``messages`` and ``params`` for a ``chat`` or ``body`` for a ``complete``, then ``reply`` and the provider ``response`` for a built-in ``chat`` binding, ``response`` for ``complete``, or ``error``, and ``seconds``; the response retains provider reasoning/thinking fields when returned; long text is clipped with a marker and a credential shaped literal is replaced by ``[redacted credential]``), ``mutations.json`` (the parsed proposal with its full options, refused or not, redacted the same way) and ``episodes/<side>-<task index>/`` (each gate episode's trajectory files as the adapter writes them, copied out of its root before the root is removed, plus ``episode.json`` with the task, the exit code, stdout and stderr, the residue, the score, the failure and the stage path; a repeat adds ``-<repeat>``); a recheck step writes ``episodes/`` only and has no proposer files; a step skipped on the step cap or the failure streak writes nothing; a step directory is never reused, so a retried step lands in ``<step>-2``, then ``<step>-3``; nothing prunes the directory; an unwritable path refuses boot and a record copy that fails aborts the step instead of scoring it
 
 The served model's binding is appended at render time; it never enters the
 published files. The seed defines the baseline the first mutation is measured
@@ -328,7 +372,7 @@ string commands retain their current ``shlex`` parsing.
    services[].ready | a shell command that succeeds once the service is up
    services[].ready_timeout | seconds to wait for ``ready`` before giving up; the top-level ``ready_timeout`` sets the default
    services[].depends_on | services that must be ready first
-   services[].cuda | the value of ``CUDA_VISIBLE_DEVICES`` for this process
+   services[].cuda | optional ``CUDA_VISIBLE_DEVICES`` for local services; Ray services must declare ``resources.num_gpus`` instead
    services[].env | extra environment variables
 
 The ``training`` section
@@ -339,8 +383,7 @@ Read by the weight-training stack. See `Evolve your model
 
 .. config::
 
-   training.num_gpus | GPUs handed to the Ray head
-   training.cuda_visible_devices | the devices Ray and Slime may use
+   training.num_gpus | example-specific GPU count passed to Slime's model topology flags; does not reserve GPUs for the driver or set the Ray cluster's capacity
    training.global_batch_size | samples in one optimizer step. Must equal the recipe's ``batch_size``.
    training.checkpoint_dir | where Megatron and HF checkpoints are written
    training.megatron_checkpoint_path | optional pre-converted torch_dist checkpoint, to skip HF conversion on every start
